@@ -15,6 +15,7 @@ bill-splitting, calculating who owes whom, multiple events/trips as separate tab
 | `/sheet` | Get the spreadsheet link |
 | `/newevent` | Create a new sheet/tab for a trip or event, and switch to it |
 | `/switch` | Switch between sheets (current month / any event) |
+| `/setmembers` | Save group names for quick-select buttons |
 | `/cancel` | Cancel whatever you're doing |
 
 Every sheet (tab) has these columns: **Date & Time, Place, Buying List, Price, Paid By, Shared By, Amount/Person**.
@@ -43,9 +44,11 @@ This takes about 15–20 minutes the first time, then it's a one-click run after
 
 1. Download Python 3.11+ from https://www.python.org/downloads/
 2. Run the installer. **Check the box "Add python.exe to PATH"** before clicking Install.
-3. Confirm it worked: open **PowerShell** (search "PowerShell" in the Start menu) and run: 
+3. Confirm it worked: open **PowerShell** (search "PowerShell" in the Start menu) and run:
 
-```python --version```
+```
+python --version
+```
 
 ---
 
@@ -82,7 +85,9 @@ To restrict the bot to only you (recommended, since this is financial data):
 2. Click **Share** (top right) → paste the service account email from step 4 → give it **Editor** access → Send (it's fine that it can't receive email, just confirm/share anyway).
 3. Copy the Sheet's ID from the URL:
 
-```https://docs.google.com/spreadsheets/d/THIS_LONG_ID_HERE/edit```
+```
+https://docs.google.com/spreadsheets/d/THIS_LONG_ID_HERE/edit
+```
 
 ---
 
@@ -133,6 +138,7 @@ The bot only works while `python bot.py` (or `run_bot.bat`) is running. Options:
 
 - **Prices**: you can type `25000`, `25.000`, `25,000`, or `25k` — all parsed the same way.
 - **Personal vs Group Expenses**: Use `/add` for simple, personal logging. Use `/split` for any shared bills.
+- **Quick-Select Buttons**: Type `/setmembers Name1, Name2, Name3` in any chat or group. The bot will remember those members and generate clickable buttons whenever it asks who paid for an expense!
 - **Calculating Debts (`/summary`)**: The bot will pair up debtors and creditors automatically. You can filter the summary by dates (using `DD-MM-YYYY` format):
   - `/summary` (calculates all dates in the active sheet)
   - `/summary 20-06-2026` (calculates for a single day)
@@ -144,11 +150,11 @@ The bot only works while `python bot.py` (or `run_bot.bat`) is running. Options:
   jump between the current month's tab and any event tab. New `/add`/`/split` entries always go to
   whichever tab is currently active.
 - **Multiple people, one bot**: anyone in `ALLOWED_CHAT_IDS` (or anyone, if you left it empty) can use
-  the same bot — each Telegram chat (you 1-on-1, or a group chat) has its own "active sheet" memory.
+  the same bot — each Telegram chat (you 1-on-1, or a group chat) has its own "active sheet" and member list memory.
 
 ---
 
 ## Notes
 - All data lives in your own Google Sheet — you can open, edit, or chart it manually any time.
 - `state.json` (created automatically next to `bot.py`) just remembers which tab each chat is
-  currently using — safe to delete if you want to reset everyone back to "current month".
+  currently using and custom group members — safe to delete if you want to reset everyone back to defaults.
