@@ -12,3 +12,4 @@ dist/
 Thumbs.db
 
 credentials.json
+state.json
