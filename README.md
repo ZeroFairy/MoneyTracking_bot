@@ -1,15 +1,15 @@
 # 💸 Expense Tracker Telegram Bot
 
 A Telegram bot that records expenses straight into a Google Sheet — including group
-bill-splitting, multiple events/trips as separate tabs, and an automatic new sheet
-every month.
+bill-splitting, calculating who owes whom, multiple events/trips as separate tabs, and an automatic new sheet every month.
 
 ## What it does
 
 | Command | What it does |
 |---|---|
-| `/add` | Add one expense (item, price, paid by, who's sharing it) |
+| `/add` | Log a personal expense (place, item, price, paid by) |
 | `/split` | Split a group bill — itemized (everyone ordered different things) or split evenly |
+| `/summary` | Calculate who owes whom (supports filtering by date) |
 | `/list` | Show the last 10 entries in the active sheet |
 | `/delete` | Delete an entry (tap from a list) |
 | `/sheet` | Get the spreadsheet link |
@@ -17,8 +17,7 @@ every month.
 | `/switch` | Switch between sheets (current month / any event) |
 | `/cancel` | Cancel whatever you're doing |
 
-Every sheet (tab) has these columns: **Date & Time, Buying List, Price, Paid By, Shared By,
-Amount/Person, Picture**. ("Picture" is reserved for a future version — see Notes below.)
+Every sheet (tab) has these columns: **Date & Time, Place, Buying List, Price, Paid By, Shared By, Amount/Person**.
 
 By default, all entries go into a tab named after the current month (e.g. `Jun 2026`).
 The first time you use the bot in a new month, that tab is created automatically.
@@ -44,10 +43,9 @@ This takes about 15–20 minutes the first time, then it's a one-click run after
 
 1. Download Python 3.11+ from https://www.python.org/downloads/
 2. Run the installer. **Check the box "Add python.exe to PATH"** before clicking Install.
-3. Confirm it worked: open **PowerShell** (search "PowerShell" in the Start menu) and run:
-   ```
-   python --version
-   ```
+3. Confirm it worked: open **PowerShell** (search "PowerShell" in the Start menu) and run: 
+
+```python --version```
 
 ---
 
@@ -70,11 +68,11 @@ To restrict the bot to only you (recommended, since this is financial data):
 1. Go to https://console.cloud.google.com/ and create a new project (any name, e.g. "Expense Bot").
 2. In the search bar, search **"Google Sheets API"** → click **Enable**.
 3. In the left menu: **IAM & Admin → Service Accounts → Create Service Account**.
-   - Name it anything (e.g. `expense-bot`), click through the defaults, click **Done**.
+- Name it anything (e.g. `expense-bot`), click through the defaults, click **Done**.
 4. Click on the service account you just created → **Keys** tab → **Add Key → Create new key → JSON**.
-   - This downloads a `.json` file. **Rename it to `credentials.json`** and move it into your bot's project folder.
+- This downloads a `.json` file. **Rename it to `credentials.json`** and move it into your bot's project folder.
 5. Open `credentials.json` in Notepad and find the `"client_email"` field — it looks like
-   `expense-bot@your-project.iam.gserviceaccount.com`. Copy this email, you need it next.
+`expense-bot@your-project.iam.gserviceaccount.com`. Copy this email, you need it next.
 
 ---
 
@@ -83,9 +81,8 @@ To restrict the bot to only you (recommended, since this is financial data):
 1. Go to https://sheets.google.com and create a new blank spreadsheet (e.g. "Expenses").
 2. Click **Share** (top right) → paste the service account email from step 4 → give it **Editor** access → Send (it's fine that it can't receive email, just confirm/share anyway).
 3. Copy the Sheet's ID from the URL:
-   ```
-   https://docs.google.com/spreadsheets/d/THIS_LONG_ID_HERE/edit
-   ```
+
+```https://docs.google.com/spreadsheets/d/THIS_LONG_ID_HERE/edit```
 
 ---
 
@@ -93,12 +90,14 @@ To restrict the bot to only you (recommended, since this is financial data):
 
 1. In the project folder, copy `.env.example` to a new file named `.env`.
 2. Open `.env` in Notepad and fill in:
-   ```
-   TELEGRAM_BOT_TOKEN=<the token from BotFather>
-   GOOGLE_SHEETS_ID=<the sheet ID from step 5>
-   GOOGLE_CREDENTIALS_FILE=credentials.json
-   ALLOWED_CHAT_IDS=<your chat ID, optional>
-   ```
+
+```
+TELEGRAM_BOT_TOKEN=
+GOOGLE_SHEETS_ID=<the sheet ID from step 5>
+GOOGLE_CREDENTIALS_FILE=credentials.json
+ALLOWED_CHAT_IDS=<your chat ID, optional>
+```
+
 3. Make sure `credentials.json` is in the same folder as `bot.py`.
 
 ---
@@ -127,14 +126,17 @@ The bot only works while `python bot.py` (or `run_bot.bat`) is running. Options:
   Startup folder. Create a shortcut to `run_bot.bat` there, and it'll launch every time you log in.
 - **Run hidden (no visible window):** rename `run_bot.bat`'s `python` call to `pythonw` (the windowless
   Python interpreter) — edit `run_bot.bat` and replace `python bot.py` with `pythonw bot.py`.
-- **More robust (advanced):** use a tool like [NSSM](https://nssm.cc/) to register `bot.py` as an
-  actual Windows service that restarts automatically if it crashes.
 
 ---
 
 ## 9. Usage tips
 
 - **Prices**: you can type `25000`, `25.000`, `25,000`, or `25k` — all parsed the same way.
+- **Personal vs Group Expenses**: Use `/add` for simple, personal logging. Use `/split` for any shared bills.
+- **Calculating Debts (`/summary`)**: The bot will pair up debtors and creditors automatically. You can filter the summary by dates (using `DD-MM-YYYY` format):
+  - `/summary` (calculates all dates in the active sheet)
+  - `/summary 20-06-2026` (calculates for a single day)
+  - `/summary 15-06-2026 20-06-2026` (calculates a date range)
 - **Splitting a restaurant bill where everyone ordered different things**: use `/split` → "Itemized",
   then send lines like `Nasi Goreng | 25000 | Andi, Budi` (pipe-separated). Type `/done` when finished.
 - **Splitting one shared total evenly**: use `/split` → "Split Evenly".
@@ -146,13 +148,7 @@ The bot only works while `python bot.py` (or `run_bot.bat`) is running. Options:
 
 ---
 
-## Notes & possible future additions
-
-- **Receipt photo scanning** was intentionally left out of this version (per your choice) — the
-  "Picture" column is there for a future version. The cleanest way to add it later: when a photo is
-  sent, run it through an AI vision model (e.g. the Anthropic API) to extract item/price lines
-  automatically, then feed those into the same `/add`-style confirmation flow already built here.
-  The hooks (column, conversation pattern) are already in place, so this is a contained addition.
+## Notes
 - All data lives in your own Google Sheet — you can open, edit, or chart it manually any time.
 - `state.json` (created automatically next to `bot.py`) just remembers which tab each chat is
   currently using — safe to delete if you want to reset everyone back to "current month".
