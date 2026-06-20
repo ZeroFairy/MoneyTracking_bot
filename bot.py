@@ -125,14 +125,46 @@ async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     sheet_name = active_sheet_name(chat_id)
     
-    await update.message.reply_text(f"📊 Calculating settlement for *{sheet_name}*...", parse_mode="Markdown")
+    args = context.args
+    start_date_str = None
+    end_date_str = None
+    
+    # Parse dates from the command arguments
+    if len(args) >= 1:
+        start_date_str = args[0]
+        end_date_str = args[0] # Assume single day first
+    if len(args) >= 2:
+        if args[1].lower() == "to" and len(args) >= 3: # Handle "/summary 15-06-2026 to 20-06-2026"
+            end_date_str = args[2]
+        else: # Handle "/summary 15-06-2026 20-06-2026"
+            end_date_str = args[1]
+            
+    # Validate the date format
+    from datetime import datetime
+    try:
+        if start_date_str:
+            datetime.strptime(start_date_str, "%d-%m-%Y")
+        if end_date_str:
+            datetime.strptime(end_date_str, "%d-%m-%Y")
+    except ValueError:
+        await update.message.reply_text("⚠️ Invalid date format. Please use DD-MM-YYYY\nExamples:\n`/summary 20-06-2026`\n`/summary 15-06-2026 20-06-2026`", parse_mode="Markdown")
+        return
+
+    # Create a nice message about what dates are being checked
+    date_msg = "all dates"
+    if start_date_str == end_date_str and start_date_str:
+        date_msg = f"{start_date_str}"
+    elif start_date_str and end_date_str:
+        date_msg = f"{start_date_str} to {end_date_str}"
+
+    await update.message.reply_text(f"📊 Calculating settlement for *{sheet_name}* ({date_msg})...", parse_mode="Markdown")
 
     try:
-        transactions = sheets.get_settlement_summary(sheet_name)
+        transactions = sheets.get_settlement_summary(sheet_name, start_date_str, end_date_str)
         if not transactions:
-            await update.message.reply_text("🎉 Everybody is settled up! No one owes anything.")
+            await update.message.reply_text("🎉 Everybody is settled up for this period! No one owes anything.")
         else:
-            text = f"🧾 *Settlement for {sheet_name}*\n\n" + "\n".join(transactions)
+            text = f"🧾 *Settlement ({date_msg})*\n\n" + "\n".join(transactions)
             await update.message.reply_text(text, parse_mode="Markdown")
     except Exception as e:
         logger.error(f"Summary error: {e}")
@@ -224,16 +256,6 @@ async def switch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # /add  (single expense)
 # ---------------------------------------------------------------------------
 
-# async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-#     context.chat_data["draft"] = {}
-#     await update.message.reply_text("📝 What did you buy?")
-#     return ADD_ITEM
-
-# async def add_place(update: Update, context: ContextTypes.DEFAULT_TYPE):
-#     context.chat_data["draft"]["place"] = update.message.text.strip()
-#     await update.message.reply_text("📍 Where did you spend this? (e.g. Indomaret, Steam, Resto X)")
-#     return ADD_PLACE
-
 async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data["draft"] = {}
     await update.message.reply_text("📍 Where did you spend this? (e.g. Indomaret, Steam, Resto X)")
@@ -266,46 +288,37 @@ async def add_paid_by_button(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
     name = query.data.split(":", 1)[1]
-    context.chat_data["draft"]["paid_by"] = name
-    await query.edit_message_text(f"🙋 Paid by: {name}")
-    await query.message.reply_text("👥 Who's sharing this? (comma-separated names, or just 'me')")
-    return ADD_SHARED_BY
-
+    return await _finalize_add(update.effective_chat.id, name, context, query.message, edit=True)
 
 async def add_paid_by_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.chat_data["draft"]["paid_by"] = update.message.text.strip()
-    await update.message.reply_text("👥 Who's sharing this? (comma-separated names, or just 'me')")
-    return ADD_SHARED_BY
+    name = update.message.text.strip()
+    return await _finalize_add(update.effective_chat.id, name, context, update.message, edit=False)
 
-
-async def add_shared_by(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text.lower() == "me":
-        names = [update.effective_user.first_name]
-    else:
-        names = [n.strip() for n in text.split(",") if n.strip()]
-    if not names:
-        await update.message.reply_text("Please tell me at least one name.")
-        return ADD_SHARED_BY
-
+async def _finalize_add(chat_id, payer_name, context, message_obj, edit=False):
     draft = context.chat_data["draft"]
-    draft["shared_by"] = names
-    draft["amount_per_person"] = round(draft["price"] / len(names), 2)
+    draft["paid_by"] = payer_name
+    
+    # Auto-fill shared_by with just the payer (since /split handles groups)
+    draft["shared_by"] = [payer_name]
+    draft["amount_per_person"] = draft["price"]
 
     summary = (
         f"📋 *Confirm entry*\n"
         f"Place: {draft['place']}\n"
         f"Item: {draft['item']}\n"
         f"Price: {format_price(draft['price'])}\n"
-        f"Paid by: {draft['paid_by']}\n"
-        f"Shared by: {', '.join(names)}\n"
-        f"Per person: {format_price(draft['amount_per_person'])}\n\n"
-        f"Sheet: {active_sheet_name(update.effective_chat.id)}"
+        f"Paid by: {draft['paid_by']}\n\n"
+        f"Sheet: {active_sheet_name(chat_id)}"
     )
     kb = [[InlineKeyboardButton("✅ Save", callback_data="add_save"), InlineKeyboardButton("❌ Cancel", callback_data="add_cancel")]]
-    await update.message.reply_text(summary, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+    
+    if edit:
+        # Changed edit_message_text to edit_text here!
+        await message_obj.edit_text(summary, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+    else:
+        await message_obj.reply_text(summary, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+    
     return ADD_CONFIRM
-
 
 async def add_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -577,7 +590,6 @@ def main():
                 CallbackQueryHandler(add_paid_by_button, pattern=r"^paidby:"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_paid_by_text),
             ],
-            ADD_SHARED_BY: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_shared_by)],
             ADD_CONFIRM: [CallbackQueryHandler(add_confirm, pattern=r"^add_(save|cancel)$")],
         },
         fallbacks=[CommandHandler("cancel", cancel_cmd)],

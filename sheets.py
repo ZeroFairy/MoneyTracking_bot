@@ -91,16 +91,41 @@ def spreadsheet_url():
     return _spreadsheet().url
 
 
-def get_settlement_summary(sheet_name: str):
+def get_settlement_summary(sheet_name: str, start_date_str=None, end_date_str=None):
     ws = get_or_create_worksheet(sheet_name)
     data = ws.get_all_values()[1:]  # Skip the header row
     from utils import parse_price, format_price
+    from datetime import datetime
+
+    # Parse filter dates if provided
+    start_date = None
+    end_date = None
+    if start_date_str:
+        start_date = datetime.strptime(start_date_str, "%d-%m-%Y").date()
+    if end_date_str:
+        end_date = datetime.strptime(end_date_str, "%d-%m-%Y").date()
 
     balances = {}
     for row in data:
         if len(row) < 7: 
             continue  # Skip broken/empty rows
             
+        # --- Date Filtering ---
+        if start_date or end_date:
+            try:
+                # Extract just the date part from "DD-MM-YYYY HH:MM"
+                row_date_str = row[0].split(" ")[0] 
+                row_date = datetime.strptime(row_date_str, "%d-%m-%Y").date()
+                
+                if start_date and row_date < start_date:
+                    continue
+                if end_date and row_date > end_date:
+                    continue
+            except Exception:
+                # If date parsing fails on a row, we just skip that row entirely
+                continue
+        # ----------------------
+
         try:
             price = parse_price(row[3])
             payer = row[4].strip()
@@ -110,20 +135,18 @@ def get_settlement_summary(sheet_name: str):
             if not payer or not shared_by_str: 
                 continue
 
-            # 1. Give the payer back their money
+            # Give the payer back their money
             balances[payer] = balances.get(payer, 0.0) + price
 
-            # 2. Deduct the share from everyone involved
+            # Deduct the share from everyone involved
             sharers = [s.strip() for s in shared_by_str.split(",")]
             if amt_str != "-":
                 amt_per_person = parse_price(amt_str)
                 for s in sharers:
                     balances[s] = balances.get(s, 0.0) - amt_per_person
         except ValueError:
-            # Skip any rows that have text where numbers should be
             continue
 
-    # 3. Split people into who owes money (debtors) and who gets paid (creditors)
     debtors = []
     creditors = []
     for name, amount in balances.items():
@@ -132,11 +155,9 @@ def get_settlement_summary(sheet_name: str):
         elif amount > 10.0:
             creditors.append([name, amount])
 
-    # Sort them so big debts are settled first
     debtors.sort(key=lambda x: x[1], reverse=True)
     creditors.sort(key=lambda x: x[1], reverse=True)
 
-    # 4. Figure out exactly who pays whom
     transactions = []
     i, j = 0, 0
     while i < len(debtors) and j < len(creditors):
