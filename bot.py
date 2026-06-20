@@ -64,6 +64,7 @@ HELP_TEXT = (
     "/sheet — get the spreadsheet link\n"
     "/newevent — create a new sheet for a trip/event\n"
     "/switch — switch between sheets\n"
+    "/setmembers — save group names for quick-select buttons\n"
     "/cancel — cancel the current action\n\n"
     "📅 *Summary Commands:*\n"
     "• `/summary` (calculates all dates)\n"
