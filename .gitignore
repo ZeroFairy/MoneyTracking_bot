@@ -13,3 +13,5 @@ Thumbs.db
 
 credentials.json
 state.json
+
+__pycache__
