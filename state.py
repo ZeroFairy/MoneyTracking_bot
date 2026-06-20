@@ -32,3 +32,13 @@ def set_active_sheet(chat_id: int, name) -> None:
     else:
         data[str(chat_id)] = name
     _save(data)
+
+def get_members(chat_id: int):
+    """Returns the saved member list for this chat."""
+    return _load().get(f"members_{chat_id}", [])
+
+def set_members(chat_id: int, members: list) -> None:
+    """Saves a new member list for this chat."""
+    data = _load()
+    data[f"members_{chat_id}"] = members
+    _save(data)

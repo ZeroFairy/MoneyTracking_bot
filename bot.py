@@ -181,6 +181,21 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def setmembers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.replace("/setmembers", "").strip()
+    if not text:
+        await update.message.reply_text(
+            "Please provide names separated by commas. \nExample: `/setmembers Andi, Budi, Charlie`", 
+            parse_mode="Markdown"
+        )
+        return
+    
+    names = [n.strip() for n in text.split(",") if n.strip()]
+    chat_id = update.effective_chat.id
+    state.set_members(chat_id, names)
+    
+    await update.message.reply_text(f"✅ Saved {len(names)} members for this chat: {', '.join(names)}")
+
 # ---------------------------------------------------------------------------
 # /delete
 # ---------------------------------------------------------------------------
@@ -368,8 +383,46 @@ async def split_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def split_place(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data["split"]["place"] = update.message.text.strip()
-    await update.message.reply_text("Who paid the bill overall?")
+    chat_id = update.effective_chat.id
+    members = state.get_members(chat_id)
+    
+    text = "Who paid the bill overall?"
+    if members:
+        # Build a 2-column grid of buttons
+        kb = []
+        row = []
+        for m in members:
+            row.append(InlineKeyboardButton(m, callback_data=f"payer:{m}"))
+            if len(row) == 2:
+                kb.append(row)
+                row = []
+        if row:
+            kb.append(row)
+        kb.append([InlineKeyboardButton("✍️ Type it manually...", callback_data="payer:__manual__")])
+        
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
+    else:
+        await update.message.reply_text(text + "\n*(Tip: Use /setmembers Andi, Budi to get buttons here!)*", parse_mode="Markdown")
+        
     return SPLIT_PAYER
+
+async def split_payer_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    payer = query.data.split(":", 1)[1]
+    
+    if payer == "__manual__":
+        await query.edit_message_text("Please type the name of the person who paid:")
+        return SPLIT_PAYER
+        
+    context.chat_data["split"]["payer"] = payer
+    await query.edit_message_text(
+        f"Paid by: {payer}\n\nNow send each item like this:\n`Item | Price | Names`\n"
+        "Example: `Nasi Goreng | 25000 | Andi, Budi`\n\n"
+        "Send one item per message. Type /done when finished.",
+        parse_mode="Markdown",
+    )
+    return SPLIT_ITEMS
 
 async def even_place(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data["even"]["place"] = update.message.text.strip()
@@ -504,8 +557,41 @@ async def even_names(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Please give at least one name.")
         return EVEN_NAMES
     context.chat_data["even"]["names"] = names
-    await update.message.reply_text("Who paid the bill?")
+    
+    chat_id = update.effective_chat.id
+    members = state.get_members(chat_id)
+    
+    text = "Who paid the bill?"
+    if members:
+        kb = []
+        row = []
+        for m in members:
+            row.append(InlineKeyboardButton(m, callback_data=f"evenpayer:{m}"))
+            if len(row) == 2:
+                kb.append(row)
+                row = []
+        if row:
+            kb.append(row)
+        kb.append([InlineKeyboardButton("✍️ Type it manually...", callback_data="evenpayer:__manual__")])
+        
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
+    else:
+        await update.message.reply_text(text)
+        
     return EVEN_PAYER
+
+async def even_payer_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    payer = query.data.split(":", 1)[1]
+    
+    if payer == "__manual__":
+        await query.edit_message_text("Please type the name of the person who paid:")
+        return EVEN_PAYER
+        
+    context.chat_data["even"]["payer"] = payer
+    await query.edit_message_text(f"Paid by: {payer}\n\nWhat's the total amount?")
+    return EVEN_TOTAL
 
 
 async def even_total(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -583,6 +669,7 @@ def main():
     app.add_handler(CommandHandler("switch", restricted(switch_cmd)))
     app.add_handler(CallbackQueryHandler(switch_callback, pattern=r"^switch:"))
     app.add_handler(CommandHandler("summary", restricted(summary_cmd)))
+    app.add_handler(CommandHandler("setmembers", restricted(setmembers_cmd)))
 
     add_conv = ConversationHandler(
         entry_points=[CommandHandler("add", restricted(add_start))],
@@ -612,7 +699,10 @@ def main():
         states={
             SPLIT_MODE: [CallbackQueryHandler(split_mode, pattern=r"^split_mode:")],
             SPLIT_PLACE: [MessageHandler(filters.TEXT & ~filters.COMMAND, split_place)],
-            SPLIT_PAYER: [MessageHandler(filters.TEXT & ~filters.COMMAND, split_payer)],
+            SPLIT_PAYER: [
+                CallbackQueryHandler(split_payer_btn, pattern=r"^payer:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, split_payer)
+            ],
             SPLIT_ITEMS: [
                 CommandHandler("done", split_done),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, split_item_line),
@@ -620,7 +710,10 @@ def main():
             SPLIT_TAX: [MessageHandler(filters.TEXT & ~filters.COMMAND, split_tax)],
             SPLIT_CONFIRM: [CallbackQueryHandler(split_confirm, pattern=r"^split(save|cancel)$")],
             EVEN_PLACE: [MessageHandler(filters.TEXT & ~filters.COMMAND, even_place)],
-            EVEN_PAYER: [MessageHandler(filters.TEXT & ~filters.COMMAND, even_payer)],
+            EVEN_PAYER: [
+                CallbackQueryHandler(even_payer_btn, pattern=r"^evenpayer:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, even_payer)
+            ],
             EVEN_NAMES: [MessageHandler(filters.TEXT & ~filters.COMMAND, even_names)],
             EVEN_TOTAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, even_total)],
             EVEN_LABEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, even_label)],
