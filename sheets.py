@@ -174,3 +174,63 @@ def get_settlement_summary(sheet_name: str, start_date_str=None, end_date_str=No
         if creditors[j][1] < 10.0: j += 1
 
     return transactions
+
+
+def get_raw_summary(sheet_name: str, start_date_str=None, end_date_str=None):
+    ws = get_or_create_worksheet(sheet_name)
+    data = ws.get_all_values()[1:]  # Skip the header row
+    from utils import parse_price, format_price
+    from datetime import datetime
+
+    # Parse filter dates if provided
+    start_date = None
+    end_date = None
+    if start_date_str:
+        start_date = datetime.strptime(start_date_str, "%d-%m-%Y").date()
+    if end_date_str:
+        end_date = datetime.strptime(end_date_str, "%d-%m-%Y").date()
+
+    direct_debts = {}
+    for row in data:
+        if len(row) < 7: 
+            continue  # Skip broken/empty rows
+            
+        # --- Date Filtering ---
+        if start_date or end_date:
+            try:
+                row_date_str = row[0].split(" ")[0] 
+                row_date = datetime.strptime(row_date_str, "%d-%m-%Y").date()
+                
+                if start_date and row_date < start_date:
+                    continue
+                if end_date and row_date > end_date:
+                    continue
+            except Exception:
+                continue
+        # ----------------------
+
+        try:
+            payer = row[4].strip()
+            shared_by_str = row[5].strip()
+            amt_str = row[6].strip()
+
+            if not payer or not shared_by_str or amt_str == "-": 
+                continue
+
+            amt_per_person = parse_price(amt_str)
+            sharers = [s.strip() for s in shared_by_str.split(",")]
+            
+            for person in sharers:
+                if person.lower() != payer.lower():
+                    debt_pair = (person, payer)
+                    direct_debts[debt_pair] = direct_debts.get(debt_pair, 0.0) + amt_per_person
+                    
+        except ValueError:
+            continue
+
+    transactions = []
+    for (debtor, creditor), amount in direct_debts.items():
+        if amount > 10.0: # Ignore tiny decimal rounding errors
+            transactions.append(f"💸 *{debtor}* pays *{creditor}*: {format_price(amount)}")
+
+    return transactions

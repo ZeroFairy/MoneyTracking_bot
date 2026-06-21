@@ -26,3 +26,4 @@ def format_price(value) -> str:
     if value is None:
         return "-"
     return "Rp" + format(round(float(value)), ",").replace(",", ".")
+    

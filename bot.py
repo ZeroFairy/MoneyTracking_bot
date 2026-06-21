@@ -53,6 +53,7 @@ NEWEVENT_NAME = 6
     EVEN_LABEL,
     EVEN_CONFIRM,
 ) = range(7, 19)
+SUMMARY_MODE, SUMMARY_SCOPE, SUMMARY_DATE_INPUT = range(19, 22)
 
 HELP_TEXT = (
     "👋 *Expense Tracker Bot*\n\n"
@@ -126,55 +127,161 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
-async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    sheet_name = active_sheet_name(chat_id)
+# async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#     chat_id = update.effective_chat.id
+#     sheet_name = active_sheet_name(chat_id)
     
-    args = context.args
+#     args = context.args
+#     start_date_str = None
+#     end_date_str = None
+    
+#     # Parse dates from the command arguments
+#     if len(args) >= 1:
+#         start_date_str = args[0]
+#         end_date_str = args[0] # Assume single day first
+#     if len(args) >= 2:
+#         if args[1].lower() == "to" and len(args) >= 3: # Handle "/summary 15-06-2026 to 20-06-2026"
+#             end_date_str = args[2]
+#         else: # Handle "/summary 15-06-2026 20-06-2026"
+#             end_date_str = args[1]
+            
+#     # Validate the date format
+#     from datetime import datetime
+#     try:
+#         if start_date_str:
+#             datetime.strptime(start_date_str, "%d-%m-%Y")
+#         if end_date_str:
+#             datetime.strptime(end_date_str, "%d-%m-%Y")
+#     except ValueError:
+#         await update.message.reply_text("⚠️ Invalid date format. Please use DD-MM-YYYY\nExamples:\n`/summary 20-06-2026`\n`/summary 15-06-2026 20-06-2026`", parse_mode="Markdown")
+#         return
+
+#     # Create a nice message about what dates are being checked
+#     date_msg = "all dates"
+#     if start_date_str == end_date_str and start_date_str:
+#         date_msg = f"{start_date_str}"
+#     elif start_date_str and end_date_str:
+#         date_msg = f"{start_date_str} to {end_date_str}"
+
+#     await update.message.reply_text(f"📊 Calculating settlement for *{sheet_name}* ({date_msg})...", parse_mode="Markdown")
+
+#     try:
+#         transactions = sheets.get_settlement_summary(sheet_name, start_date_str, end_date_str)
+#         if not transactions:
+#             await update.message.reply_text("🎉 Everybody is settled up for this period! No one owes anything.")
+#         else:
+#             text = f"🧾 *Settlement ({date_msg})*\n\n" + "\n".join(transactions)
+#             await update.message.reply_text(text, parse_mode="Markdown")
+#     except Exception as e:
+#         logger.error(f"Summary error: {e}")
+#         await update.message.reply_text("⚠️ Could not calculate summary. Make sure the sheet data is formatted correctly.")
+
+async def summary_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    kb = [
+        [InlineKeyboardButton("📊 Smart (Optimized)", callback_data="sum_mode:smart")],
+        [InlineKeyboardButton("🧾 Normal (Straight)", callback_data="sum_mode:raw")]
+    ]
+    await update.message.reply_text("How do you want to calculate the summary?", reply_markup=InlineKeyboardMarkup(kb))
+    return SUMMARY_MODE
+
+async def summary_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    mode = query.data.split(":", 1)[1]
+    context.chat_data["summary_mode"] = mode
+
+    kb = [
+        [InlineKeyboardButton("📅 All Dates", callback_data="sum_scope:all")],
+        [InlineKeyboardButton("🗓️ Single Day", callback_data="sum_scope:day")],
+        [InlineKeyboardButton("📆 Date Range", callback_data="sum_scope:range")]
+    ]
+    
+    title = "Smart" if mode == "smart" else "Normal"
+    await query.edit_message_text(f"Selected: *{title}*\n\nWhich timeframe do you want to check?", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+    return SUMMARY_SCOPE
+
+async def summary_scope(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    scope = query.data.split(":", 1)[1]
+    context.chat_data["summary_scope"] = scope
+
+    if scope == "all":
+        return await execute_summary(update.effective_chat.id, context, query.message, None, None, edit=True)
+    elif scope == "day":
+        await query.edit_message_text("Type the date you want to check (e.g. `20-06-2026`):", parse_mode="Markdown")
+        return SUMMARY_DATE_INPUT
+    elif scope == "range":
+        await query.edit_message_text("Type the start and end dates (e.g. `15-06-2026 to 20-06-2026`):", parse_mode="Markdown")
+        return SUMMARY_DATE_INPUT
+
+async def summary_date_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip().lower().replace("to", " ").split()
+    scope = context.chat_data.get("summary_scope")
     start_date_str = None
     end_date_str = None
-    
-    # Parse dates from the command arguments
-    if len(args) >= 1:
-        start_date_str = args[0]
-        end_date_str = args[0] # Assume single day first
-    if len(args) >= 2:
-        if args[1].lower() == "to" and len(args) >= 3: # Handle "/summary 15-06-2026 to 20-06-2026"
-            end_date_str = args[2]
-        else: # Handle "/summary 15-06-2026 20-06-2026"
-            end_date_str = args[1]
-            
-    # Validate the date format
-    from datetime import datetime
+
     try:
-        if start_date_str:
+        from datetime import datetime
+        if scope == "day":
+            if len(text) != 1:
+                await update.message.reply_text("Please provide exactly one date (e.g. `20-06-2026`).")
+                return SUMMARY_DATE_INPUT
+            start_date_str = text[0]
+            end_date_str = text[0]
             datetime.strptime(start_date_str, "%d-%m-%Y")
-        if end_date_str:
+        elif scope == "range":
+            if len(text) != 2:
+                await update.message.reply_text("Please provide exactly two dates (e.g. `15-06-2026 20-06-2026`).")
+                return SUMMARY_DATE_INPUT
+            start_date_str = text[0]
+            end_date_str = text[1]
+            datetime.strptime(start_date_str, "%d-%m-%Y")
             datetime.strptime(end_date_str, "%d-%m-%Y")
     except ValueError:
-        await update.message.reply_text("⚠️ Invalid date format. Please use DD-MM-YYYY\nExamples:\n`/summary 20-06-2026`\n`/summary 15-06-2026 20-06-2026`", parse_mode="Markdown")
-        return
+        await update.message.reply_text("⚠️ Invalid date format. Please use DD-MM-YYYY.")
+        return SUMMARY_DATE_INPUT
 
-    # Create a nice message about what dates are being checked
+    return await execute_summary(update.effective_chat.id, context, update.message, start_date_str, end_date_str, edit=False)
+
+async def execute_summary(chat_id, context, message_obj, start_date_str, end_date_str, edit=False):
+    mode = context.chat_data.get("summary_mode", "smart")
+    sheet_name = active_sheet_name(chat_id)
     date_msg = "all dates"
+    
     if start_date_str == end_date_str and start_date_str:
         date_msg = f"{start_date_str}"
     elif start_date_str and end_date_str:
         date_msg = f"{start_date_str} to {end_date_str}"
 
-    await update.message.reply_text(f"📊 Calculating settlement for *{sheet_name}* ({date_msg})...", parse_mode="Markdown")
+    calc_text = f"📊 Calculating {'Smart' if mode == 'smart' else 'Straight'} settlement for *{sheet_name}* ({date_msg})..."
+    
+    if edit:
+        await message_obj.edit_text(calc_text, parse_mode="Markdown")
+    else:
+        await message_obj.reply_text(calc_text, parse_mode="Markdown")
 
     try:
-        transactions = sheets.get_settlement_summary(sheet_name, start_date_str, end_date_str)
-        if not transactions:
-            await update.message.reply_text("🎉 Everybody is settled up for this period! No one owes anything.")
+        if mode == "smart":
+            transactions = sheets.get_settlement_summary(sheet_name, start_date_str, end_date_str)
         else:
-            text = f"🧾 *Settlement ({date_msg})*\n\n" + "\n".join(transactions)
-            await update.message.reply_text(text, parse_mode="Markdown")
+            transactions = sheets.get_raw_summary(sheet_name, start_date_str, end_date_str)
+
+        if not transactions:
+            text = "🎉 Everybody is settled up for this period! No one owes anything."
+        else:
+            title = "🧾 *Smart Settlement*" if mode == "smart" else "🧾 *Straight Settlement (Bill-by-Bill)*"
+            text = f"{title}\nPeriod: {date_msg}\n\n" + "\n".join(transactions)
+            
+        # Send as a new message so it triggers a notification
+        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
     except Exception as e:
         logger.error(f"Summary error: {e}")
-        await update.message.reply_text("⚠️ Could not calculate summary. Make sure the sheet data is formatted correctly.")
+        await context.bot.send_message(chat_id=chat_id, text="⚠️ Could not calculate summary. Make sure the sheet data is formatted correctly.")
 
+    context.chat_data.pop("summary_mode", None)
+    context.chat_data.pop("summary_scope", None)
+    return ConversationHandler.END
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data.clear()
@@ -669,7 +776,7 @@ def main():
     app.add_handler(CallbackQueryHandler(delete_callback, pattern=r"^del:"))
     app.add_handler(CommandHandler("switch", restricted(switch_cmd)))
     app.add_handler(CallbackQueryHandler(switch_callback, pattern=r"^switch:"))
-    app.add_handler(CommandHandler("summary", restricted(summary_cmd)))
+    # app.add_handler(CommandHandler("summary", restricted(summary_cmd)))
     app.add_handler(CommandHandler("setmembers", restricted(setmembers_cmd)))
 
     add_conv = ConversationHandler(
@@ -687,6 +794,17 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel_cmd)],
     )
     app.add_handler(add_conv)
+
+    summary_conv = ConversationHandler(
+        entry_points=[CommandHandler("summary", restricted(summary_start))],
+        states={
+            SUMMARY_MODE: [CallbackQueryHandler(summary_mode, pattern=r"^sum_mode:")],
+            SUMMARY_SCOPE: [CallbackQueryHandler(summary_scope, pattern=r"^sum_scope:")],
+            SUMMARY_DATE_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, summary_date_input)]
+        },
+        fallbacks=[CommandHandler("cancel", cancel_cmd)],
+    )
+    app.add_handler(summary_conv)
 
     newevent_conv = ConversationHandler(
         entry_points=[CommandHandler("newevent", restricted(newevent_start))],
