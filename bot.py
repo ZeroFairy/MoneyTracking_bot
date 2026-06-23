@@ -60,8 +60,9 @@ HELP_TEXT = (
     "/add — log a personal expense\n"
     "/split — split a group bill (itemized or evenly)\n"
     "/summary — calculate who owes whom\n"
-    "/list — show recent entries\n"
+    "/list — show recent entries (with full details)\n"
     "/delete — delete an entry\n"
+    "/markpaid — mark an entry as paid or unpaid\n"
     "/sheet — get the spreadsheet link\n"
     "/newevent — create a new sheet for a trip/event\n"
     "/switch — switch between sheets\n"
@@ -119,11 +120,27 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not recent:
         await update.message.reply_text(f"No entries yet in *{name}*.", parse_mode="Markdown")
         return
-    lines = [f"🧾 Last entries in *{name}*:"]
+
+    lines = [f"🧾 Last entries in *{name}*:\n"]
     for row_num, row in recent:
-        item = row[1] if len(row) > 1 else "?"
-        price = row[2] if len(row) > 2 else "?"
-        lines.append(f"#{row_num}: {item} — {price}")
+        date    = row[0] if len(row) > 0 else "?"
+        place   = row[1] if len(row) > 1 else "?"
+        item    = row[2] if len(row) > 2 else "?"
+        price   = row[3] if len(row) > 3 else "?"
+        paid_by = row[4] if len(row) > 4 else "?"
+        shared  = row[5] if len(row) > 5 else "?"
+        per_p   = row[6] if len(row) > 6 else "?"
+        status  = row[8] if len(row) > 8 else "⏳ Unpaid"
+
+        lines.append(
+            f"*#{row_num} — {item}*\n"
+            f"📍 {place}  |  💰 {price}  |  {status}\n"
+            f"🙋 Paid by: {paid_by}\n"
+            f"👥 Shared: {shared}  ({per_p}/person)\n"
+            f"🕐 {date}"
+        )
+        lines.append("")  # blank line between entries
+
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
@@ -331,6 +348,99 @@ async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, name, row_num = query.data.split(":")
     sheets.delete_row(name, int(row_num))
     await query.edit_message_text(f"🗑️ Deleted row #{row_num} from {name}.")
+
+
+# ---------------------------------------------------------------------------
+# /markpaid  (multi-select)
+# ---------------------------------------------------------------------------
+
+def _build_markpaid_keyboard(rows, selected: set, sheet_name: str):
+    """Build the inline keyboard for multi-select markpaid."""
+    kb = []
+    for row_num, row in rows:
+        item   = row[2] if len(row) > 2 else "?"
+        price  = row[3] if len(row) > 3 else "?"
+        status = row[8] if len(row) > 8 and row[8] else "⏳ Unpaid"
+        is_checked = row_num in selected
+        check_icon = "☑️" if is_checked else "⬜"
+        current_icon = "✅" if status == "✅ Paid" else "⏳"
+        label = f"{check_icon} {current_icon} #{row_num} {item} ({price})"
+        kb.append([InlineKeyboardButton(label, callback_data=f"mpt:{row_num}")])
+    # Action row
+    kb.append([
+        InlineKeyboardButton("✅ Mark Selected Paid",   callback_data="mpapply:paid"),
+        InlineKeyboardButton("⏳ Mark Selected Unpaid", callback_data="mpapply:unpaid"),
+    ])
+    kb.append([InlineKeyboardButton("❌ Cancel", callback_data="mpcancel")])
+    return InlineKeyboardMarkup(kb)
+
+
+async def markpaid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    name = active_sheet_name(chat_id)
+    recent = sheets.get_recent(name, 10)
+    if not recent:
+        await update.message.reply_text(f"No entries yet in *{name}*.", parse_mode="Markdown")
+        return
+    # Store state in chat_data
+    context.chat_data["mp_sheet"] = name
+    context.chat_data["mp_rows"]  = recent
+    context.chat_data["mp_sel"]   = set()
+    kb = _build_markpaid_keyboard(recent, set(), name)
+    await update.message.reply_text(
+        f"☑️ *Select entries to mark* in *{name}*:\n"
+        f"_(tap to check/uncheck, then choose an action below)_",
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+
+
+async def markpaid_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    row_num = int(query.data.split(":")[1])
+    sel = context.chat_data.get("mp_sel", set())
+    if row_num in sel:
+        sel.discard(row_num)
+    else:
+        sel.add(row_num)
+    context.chat_data["mp_sel"] = sel
+    rows  = context.chat_data.get("mp_rows", [])
+    name  = context.chat_data.get("mp_sheet", "")
+    kb    = _build_markpaid_keyboard(rows, sel, name)
+    count = len(sel)
+    await query.edit_message_reply_markup(reply_markup=kb)
+    await query.answer(f"{count} selected" if count else "Deselected")
+
+
+async def markpaid_apply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    action = query.data.split(":")[1]   # "paid" or "unpaid"
+    sel    = context.chat_data.get("mp_sel", set())
+    name   = context.chat_data.get("mp_sheet", "")
+    if not sel:
+        await query.answer("No entries selected!", show_alert=True)
+        return
+    status = "✅ Paid" if action == "paid" else "⏳ Unpaid"
+    sheets.set_paid_status_bulk(name, list(sel), status)
+    emoji = "✅" if action == "paid" else "⏳"
+    context.chat_data.pop("mp_sel",   None)
+    context.chat_data.pop("mp_rows",  None)
+    context.chat_data.pop("mp_sheet", None)
+    await query.edit_message_text(
+        f"{emoji} Marked *{len(sel)}* entr{'y' if len(sel)==1 else 'ies'} as *{status}* in {name}.",
+        parse_mode="Markdown",
+    )
+
+
+async def markpaid_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.chat_data.pop("mp_sel",   None)
+    context.chat_data.pop("mp_rows",  None)
+    context.chat_data.pop("mp_sheet", None)
+    await query.edit_message_text("Cancelled.")
 
 
 # ---------------------------------------------------------------------------
@@ -774,6 +884,10 @@ def main():
     app.add_handler(CommandHandler("list", restricted(list_cmd)))
     app.add_handler(CommandHandler("delete", restricted(delete_cmd)))
     app.add_handler(CallbackQueryHandler(delete_callback, pattern=r"^del:"))
+    app.add_handler(CommandHandler("markpaid", restricted(markpaid_cmd)))
+    app.add_handler(CallbackQueryHandler(markpaid_toggle, pattern=r"^mpt:"))
+    app.add_handler(CallbackQueryHandler(markpaid_apply,  pattern=r"^mpapply:"))
+    app.add_handler(CallbackQueryHandler(markpaid_cancel, pattern=r"^mpcancel$"))
     app.add_handler(CommandHandler("switch", restricted(switch_cmd)))
     app.add_handler(CallbackQueryHandler(switch_callback, pattern=r"^switch:"))
     # app.add_handler(CommandHandler("summary", restricted(summary_cmd)))

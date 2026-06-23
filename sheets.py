@@ -5,7 +5,7 @@ import gspread
 
 from config import GOOGLE_CREDENTIALS_FILE, GOOGLE_SHEETS_ID
 
-HEADERS = ["Date & Time", "Place", "Buying List", "Price", "Paid By", "Shared By", "Amount/Person", "Picture"]
+HEADERS = ["Date & Time", "Place", "Buying List", "Price", "Paid By", "Shared By", "Amount/Person", "Picture", "Status"]
 
 _gc = None
 _sh = None
@@ -53,13 +53,13 @@ def list_sheet_titles():
     return [ws.title for ws in _spreadsheet().worksheets()]
 
 
-def append_expense(sheet_name, place, item, price, paid_by, shared_by, amount_per_person, picture="-"):
+def append_expense(sheet_name, place, item, price, paid_by, shared_by, amount_per_person, picture="-", status="⏳ Unpaid"):
     ws = get_or_create_worksheet(sheet_name)
     ts = datetime.now().strftime("%d-%m-%Y %H:%M")
     from utils import format_price
     ws.append_row(
         [ts, place, item, format_price(price), paid_by, shared_by,
-         format_price(amount_per_person) if amount_per_person is not None else "-", picture],
+         format_price(amount_per_person) if amount_per_person is not None else "-", picture, status],
         value_input_option="USER_ENTERED",
     )
     return ws
@@ -80,6 +80,28 @@ def get_recent(sheet_name, n=10):
 def delete_row(sheet_name, row_num: int):
     ws = get_or_create_worksheet(sheet_name)
     ws.delete_rows(row_num)
+
+
+STATUS_COL = 9  # 1-indexed column number for "Status"
+
+def toggle_paid_status(sheet_name: str, row_num: int) -> str:
+    """Toggle the Status cell between ✅ Paid and ⏳ Unpaid. Returns the new status."""
+    ws = get_or_create_worksheet(sheet_name)
+    current = ws.cell(row_num, STATUS_COL).value or ""
+    new_status = "✅ Paid" if current != "✅ Paid" else "⏳ Unpaid"
+    ws.update_cell(row_num, STATUS_COL, new_status)
+    return new_status
+
+
+def set_paid_status_bulk(sheet_name: str, row_nums: list, status: str):
+    """Set the Status column for multiple rows in one batch API call."""
+    ws = get_or_create_worksheet(sheet_name)
+    col_letter = chr(ord("A") + STATUS_COL - 1)  # STATUS_COL=9 → "I"
+    updates = [
+        {"range": f"{col_letter}{r}", "values": [[status]]}
+        for r in row_nums
+    ]
+    ws.batch_update(updates)
 
 
 def sheet_url(sheet_name):
