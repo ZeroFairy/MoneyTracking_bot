@@ -62,7 +62,7 @@ HELP_TEXT = (
     "/summary — calculate who owes whom\n"
     "/list — show recent entries (with full details)\n"
     "/delete — delete an entry\n"
-    "/markpaid — mark an entry as paid or unpaid\n"
+    "/markpaid — mark entries paid/unpaid; for split bills, mark per person\n"
     "/sheet — get the spreadsheet link\n"
     "/newevent — create a new sheet for a trip/event\n"
     "/switch — switch between sheets\n"
@@ -123,23 +123,27 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = [f"🧾 Last entries in *{name}*:\n"]
     for row_num, row in recent:
-        date    = row[0] if len(row) > 0 else "?"
-        place   = row[1] if len(row) > 1 else "?"
-        item    = row[2] if len(row) > 2 else "?"
-        price   = row[3] if len(row) > 3 else "?"
-        paid_by = row[4] if len(row) > 4 else "?"
-        shared  = row[5] if len(row) > 5 else "?"
-        per_p   = row[6] if len(row) > 6 else "?"
-        status  = row[8] if len(row) > 8 else "⏳ Unpaid"
+        date     = row[0] if len(row) > 0 else "?"
+        place    = row[1] if len(row) > 1 else "?"
+        item     = row[2] if len(row) > 2 else "?"
+        price    = row[3] if len(row) > 3 else "?"
+        paid_by  = row[4] if len(row) > 4 else "?"
+        shared   = row[5] if len(row) > 5 else "?"
+        per_p    = row[6] if len(row) > 6 else "?"
+        status   = row[8] if len(row) > 8 and row[8] else "⏳ Unpaid"
+        settled  = row[9] if len(row) > 9 and row[9] else ""
+
+        settled_line = f"💸 Settled: {settled}" if settled else ""
 
         lines.append(
             f"*#{row_num} — {item}*\n"
             f"📍 {place}  |  💰 {price}  |  {status}\n"
             f"🙋 Paid by: {paid_by}\n"
             f"👥 Shared: {shared}  ({per_p}/person)\n"
-            f"🕐 {date}"
+            + (f"💸 Settled: {settled}\n" if settled else "")
+            + f"🕐 {date}"
         )
-        lines.append("")  # blank line between entries
+        lines.append("")
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -351,95 +355,217 @@ async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# /markpaid  (multi-select)
+# /markpaid  — unified flow
+#
+# Step 1: list of entries (tap one to drill in)
+# Step 2a: solo entry  → toggle whole entry paid/unpaid directly
+# Step 2b: split entry → show each person as individual toggles
 # ---------------------------------------------------------------------------
 
-def _build_markpaid_keyboard(rows, selected: set, sheet_name: str):
-    """Build the inline keyboard for multi-select markpaid."""
+def _is_split(row) -> bool:
+    """True if this entry has more than one person in Shared By."""
+    shared = row[5] if len(row) > 5 else ""
+    return len([n for n in shared.split(",") if n.strip()]) > 1
+
+
+def _build_entry_list_keyboard(rows):
+    """Step 1: list every entry as a tappable button."""
     kb = []
     for row_num, row in rows:
-        item   = row[2] if len(row) > 2 else "?"
-        price  = row[3] if len(row) > 3 else "?"
-        status = row[8] if len(row) > 8 and row[8] else "⏳ Unpaid"
-        is_checked = row_num in selected
-        check_icon = "☑️" if is_checked else "⬜"
-        current_icon = "✅" if status == "✅ Paid" else "⏳"
-        label = f"{check_icon} {current_icon} #{row_num} {item} ({price})"
-        kb.append([InlineKeyboardButton(label, callback_data=f"mpt:{row_num}")])
-    # Action row
-    kb.append([
-        InlineKeyboardButton("✅ Mark Selected Paid",   callback_data="mpapply:paid"),
-        InlineKeyboardButton("⏳ Mark Selected Unpaid", callback_data="mpapply:unpaid"),
-    ])
-    kb.append([InlineKeyboardButton("❌ Cancel", callback_data="mpcancel")])
+        item    = row[2] if len(row) > 2 else "?"
+        price   = row[3] if len(row) > 3 else "?"
+        status  = row[8] if len(row) > 8 and row[8] else "⏳ Unpaid"
+        settled = row[9] if len(row) > 9 and row[9] else ""
+        s_icon  = "✅" if status == "✅ Paid" else "⏳"
+
+        if _is_split(row):
+            shared = row[5] if len(row) > 5 else ""
+            names  = [n.strip() for n in shared.split(",") if n.strip()]
+            s_names = [n.strip() for n in settled.split(",") if n.strip()]
+            badge  = f" ({len(s_names)}/{len(names)} settled)"
+            label  = f"{s_icon} #{row_num} {item} ({price}){badge} 👥"
+        else:
+            label  = f"{s_icon} #{row_num} {item} ({price})"
+
+        kb.append([InlineKeyboardButton(label, callback_data=f"mk1:{row_num}")])
+    kb.append([InlineKeyboardButton("❌ Cancel", callback_data="mkcancel")])
     return InlineKeyboardMarkup(kb)
+
+
+def _build_solo_keyboard(row_num, status):
+    """Step 2a: single-person entry — just toggle paid/unpaid."""
+    other = "⏳ Unpaid" if status == "✅ Paid" else "✅ Paid"
+    other_emoji = "⏳" if status == "✅ Paid" else "✅"
+    kb = [
+        [InlineKeyboardButton(f"Mark as {other_emoji} {other}", callback_data=f"mksolo:{row_num}")],
+        [InlineKeyboardButton("🔙 Back", callback_data="mkback"),
+         InlineKeyboardButton("❌ Cancel", callback_data="mkcancel")],
+    ]
+    return InlineKeyboardMarkup(kb)
+
+
+def _build_people_keyboard(row_num, names, settled_set):
+    """Step 2b: split entry — toggle each person individually."""
+    kb = []
+    for name in names:
+        icon  = "✅" if name in settled_set else "⏳"
+        kb.append([InlineKeyboardButton(f"{icon} {name}", callback_data=f"mkperson:{row_num}:{name}")])
+    kb.append([
+        InlineKeyboardButton("💾 Save", callback_data=f"mksave:{row_num}"),
+        InlineKeyboardButton("🔙 Back", callback_data="mkback"),
+    ])
+    kb.append([InlineKeyboardButton("❌ Cancel", callback_data="mkcancel")])
+    return InlineKeyboardMarkup(kb)
+
+
+def _mk_cleanup(context):
+    for k in ("mk_sheet", "mk_rows", "mk_names", "mk_settled"):
+        context.chat_data.pop(k, None)
 
 
 async def markpaid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    name = active_sheet_name(chat_id)
-    recent = sheets.get_recent(name, 10)
+    name    = active_sheet_name(chat_id)
+    recent  = sheets.get_recent(name, 10)
     if not recent:
         await update.message.reply_text(f"No entries yet in *{name}*.", parse_mode="Markdown")
         return
-    # Store state in chat_data
-    context.chat_data["mp_sheet"] = name
-    context.chat_data["mp_rows"]  = recent
-    context.chat_data["mp_sel"]   = set()
-    kb = _build_markpaid_keyboard(recent, set(), name)
+    context.chat_data["mk_sheet"] = name
+    context.chat_data["mk_rows"]  = recent
+    kb = _build_entry_list_keyboard(recent)
     await update.message.reply_text(
-        f"☑️ *Select entries to mark* in *{name}*:\n"
-        f"_(tap to check/uncheck, then choose an action below)_",
+        f"💳 *Mark payment status* — *{name}*\n"
+        f"_(👥 = split bill, tap any entry)_",
         parse_mode="Markdown",
         reply_markup=kb,
     )
 
 
-async def markpaid_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
+async def mk_pick_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User tapped an entry — route to solo or split flow."""
+    query   = update.callback_query
     await query.answer()
     row_num = int(query.data.split(":")[1])
-    sel = context.chat_data.get("mp_sel", set())
-    if row_num in sel:
-        sel.discard(row_num)
-    else:
-        sel.add(row_num)
-    context.chat_data["mp_sel"] = sel
-    rows  = context.chat_data.get("mp_rows", [])
-    name  = context.chat_data.get("mp_sheet", "")
-    kb    = _build_markpaid_keyboard(rows, sel, name)
-    count = len(sel)
-    await query.edit_message_reply_markup(reply_markup=kb)
-    await query.answer(f"{count} selected" if count else "Deselected")
+    rows    = context.chat_data.get("mk_rows", [])
 
-
-async def markpaid_apply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    action = query.data.split(":")[1]   # "paid" or "unpaid"
-    sel    = context.chat_data.get("mp_sel", set())
-    name   = context.chat_data.get("mp_sheet", "")
-    if not sel:
-        await query.answer("No entries selected!", show_alert=True)
+    chosen = next((r for rn, r in rows if rn == row_num), None)
+    if chosen is None:
+        await query.edit_message_text("Entry not found. Try /markpaid again.")
         return
-    status = "✅ Paid" if action == "paid" else "⏳ Unpaid"
-    sheets.set_paid_status_bulk(name, list(sel), status)
-    emoji = "✅" if action == "paid" else "⏳"
-    context.chat_data.pop("mp_sel",   None)
-    context.chat_data.pop("mp_rows",  None)
-    context.chat_data.pop("mp_sheet", None)
+
+    item   = chosen[2] if len(chosen) > 2 else "?"
+    price  = chosen[3] if len(chosen) > 3 else "?"
+    status = chosen[8] if len(chosen) > 8 and chosen[8] else "⏳ Unpaid"
+
+    if _is_split(chosen):
+        # Split bill → show per-person toggles
+        shared  = chosen[5] if len(chosen) > 5 else ""
+        settled = chosen[9] if len(chosen) > 9 and chosen[9] else ""
+        names   = [n.strip() for n in shared.split(",") if n.strip()]
+        s_names = set(n.strip() for n in settled.split(",") if n.strip())
+        context.chat_data["mk_names"]   = names
+        context.chat_data["mk_settled"] = s_names
+        kb = _build_people_keyboard(row_num, names, s_names)
+        await query.edit_message_text(
+            f"👥 *#{row_num} — {item}* ({price})\n"
+            f"Tap each person to toggle ✅/⏳, then Save:",
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
+    else:
+        # Solo entry → show simple toggle
+        kb = _build_solo_keyboard(row_num, status)
+        s_icon = "✅" if status == "✅ Paid" else "⏳"
+        await query.edit_message_text(
+            f"{s_icon} *#{row_num} — {item}* ({price})\nCurrently: *{status}*",
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
+
+
+async def mk_solo_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle the overall paid status for a solo entry."""
+    query   = update.callback_query
+    await query.answer()
+    row_num = int(query.data.split(":")[1])
+    name    = context.chat_data.get("mk_sheet", "")
+    new_status = sheets.toggle_paid_status(name, row_num)
+    emoji = "✅" if new_status == "✅ Paid" else "⏳"
+    _mk_cleanup(context)
     await query.edit_message_text(
-        f"{emoji} Marked *{len(sel)}* entr{'y' if len(sel)==1 else 'ies'} as *{status}* in {name}.",
+        f"{emoji} Row *#{row_num}* marked as *{new_status}*.",
         parse_mode="Markdown",
     )
 
 
-async def markpaid_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def mk_person_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle one person's settled status in a split entry."""
+    query  = update.callback_query
+    parts  = query.data.split(":", 2)   # mkperson:ROWNUM:NAME
+    row_num = int(parts[1])
+    person  = parts[2]
+
+    settled = context.chat_data.get("mk_settled", set())
+    if person in settled:
+        settled.discard(person)
+        await query.answer(f"⏳ {person} — not settled")
+    else:
+        settled.add(person)
+        await query.answer(f"✅ {person} — settled")
+    context.chat_data["mk_settled"] = settled
+
+    names = context.chat_data.get("mk_names", [])
+    kb    = _build_people_keyboard(row_num, names, settled)
+    await query.edit_message_reply_markup(reply_markup=kb)
+
+
+async def mk_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Save per-person settled list to sheet."""
+    query   = update.callback_query
+    await query.answer()
+    row_num = int(query.data.split(":")[1])
+    name    = context.chat_data.get("mk_sheet", "")
+    settled = context.chat_data.get("mk_settled", set())
+    names   = context.chat_data.get("mk_names", [])
+
+    ordered   = [n for n in names if n in settled]
+    remaining = [n for n in names if n not in settled]
+    sheets.set_settled_by(name, row_num, ordered)
+
+    if not ordered:
+        summary = "No one marked as settled yet."
+    elif not remaining:
+        summary = "Everyone has settled! 🎉"
+    else:
+        summary = f"✅ Settled: {', '.join(ordered)}\n⏳ Still owes: {', '.join(remaining)}"
+
+    _mk_cleanup(context)
+    await query.edit_message_text(
+        f"💾 *Saved — #{row_num}*\n{summary}",
+        parse_mode="Markdown",
+    )
+
+
+async def mk_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Go back to the entry list."""
     query = update.callback_query
     await query.answer()
-    context.chat_data.pop("mp_sel",   None)
-    context.chat_data.pop("mp_rows",  None)
-    context.chat_data.pop("mp_sheet", None)
+    rows = context.chat_data.get("mk_rows", [])
+    name = context.chat_data.get("mk_sheet", "")
+    context.chat_data.pop("mk_names",   None)
+    context.chat_data.pop("mk_settled", None)
+    kb = _build_entry_list_keyboard(rows)
+    await query.edit_message_text(
+        f"💳 *Mark payment status* — *{name}*\n_(👥 = split bill, tap any entry)_",
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+
+
+async def mk_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _mk_cleanup(context)
     await query.edit_message_text("Cancelled.")
 
 
@@ -884,10 +1010,13 @@ def main():
     app.add_handler(CommandHandler("list", restricted(list_cmd)))
     app.add_handler(CommandHandler("delete", restricted(delete_cmd)))
     app.add_handler(CallbackQueryHandler(delete_callback, pattern=r"^del:"))
-    app.add_handler(CommandHandler("markpaid", restricted(markpaid_cmd)))
-    app.add_handler(CallbackQueryHandler(markpaid_toggle, pattern=r"^mpt:"))
-    app.add_handler(CallbackQueryHandler(markpaid_apply,  pattern=r"^mpapply:"))
-    app.add_handler(CallbackQueryHandler(markpaid_cancel, pattern=r"^mpcancel$"))
+    app.add_handler(CommandHandler("markpaid",   restricted(markpaid_cmd)))
+    app.add_handler(CallbackQueryHandler(mk_pick_entry,   pattern=r"^mk1:"))
+    app.add_handler(CallbackQueryHandler(mk_solo_toggle,  pattern=r"^mksolo:"))
+    app.add_handler(CallbackQueryHandler(mk_person_toggle,pattern=r"^mkperson:"))
+    app.add_handler(CallbackQueryHandler(mk_save,         pattern=r"^mksave:"))
+    app.add_handler(CallbackQueryHandler(mk_back,         pattern=r"^mkback$"))
+    app.add_handler(CallbackQueryHandler(mk_cancel,       pattern=r"^mkcancel$"))
     app.add_handler(CommandHandler("switch", restricted(switch_cmd)))
     app.add_handler(CallbackQueryHandler(switch_callback, pattern=r"^switch:"))
     # app.add_handler(CommandHandler("summary", restricted(summary_cmd)))

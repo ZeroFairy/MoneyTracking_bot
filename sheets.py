@@ -5,7 +5,7 @@ import gspread
 
 from config import GOOGLE_CREDENTIALS_FILE, GOOGLE_SHEETS_ID
 
-HEADERS = ["Date & Time", "Place", "Buying List", "Price", "Paid By", "Shared By", "Amount/Person", "Picture", "Status"]
+HEADERS = ["Date & Time", "Place", "Buying List", "Price", "Paid By", "Shared By", "Amount/Person", "Picture", "Status", "Settled By"]
 
 _gc = None
 _sh = None
@@ -59,7 +59,7 @@ def append_expense(sheet_name, place, item, price, paid_by, shared_by, amount_pe
     from utils import format_price
     ws.append_row(
         [ts, place, item, format_price(price), paid_by, shared_by,
-         format_price(amount_per_person) if amount_per_person is not None else "-", picture, status],
+         format_price(amount_per_person) if amount_per_person is not None else "-", picture, status, ""],
         value_input_option="USER_ENTERED",
     )
     return ws
@@ -104,6 +104,22 @@ def set_paid_status_bulk(sheet_name: str, row_nums: list, status: str):
     ws.batch_update(updates)
 
 
+SETTLED_COL = 10  # 1-indexed column number for "Settled By"
+
+
+def get_settled_by(sheet_name: str, row_num: int) -> list:
+    """Returns list of names who have settled this row (empty list if none)."""
+    ws = get_or_create_worksheet(sheet_name)
+    val = ws.cell(row_num, SETTLED_COL).value or ""
+    return [n.strip() for n in val.split(",") if n.strip()]
+
+
+def set_settled_by(sheet_name: str, row_num: int, names: list):
+    """Write the settled-by list back to the sheet."""
+    ws = get_or_create_worksheet(sheet_name)
+    ws.update_cell(row_num, SETTLED_COL, ", ".join(names))
+
+
 def sheet_url(sheet_name):
     ws = get_or_create_worksheet(sheet_name)
     return f"{_spreadsheet().url}#gid={ws.id}"
@@ -119,7 +135,6 @@ def get_settlement_summary(sheet_name: str, start_date_str=None, end_date_str=No
     from utils import parse_price, format_price
     from datetime import datetime
 
-    # Parse filter dates if provided
     start_date = None
     end_date = None
     if start_date_str:
@@ -129,50 +144,67 @@ def get_settlement_summary(sheet_name: str, start_date_str=None, end_date_str=No
 
     balances = {}
     for row in data:
-        if len(row) < 7: 
-            continue  # Skip broken/empty rows
-            
+        if len(row) < 7:
+            continue
+
+        # --- Skip fully paid entries ---
+        status = row[8].strip() if len(row) > 8 else ""
+        if status == "✅ Paid":
+            continue
+
         # --- Date Filtering ---
         if start_date or end_date:
             try:
-                # Extract just the date part from "DD-MM-YYYY HH:MM"
-                row_date_str = row[0].split(" ")[0] 
+                row_date_str = row[0].split(" ")[0]
                 row_date = datetime.strptime(row_date_str, "%d-%m-%Y").date()
-                
                 if start_date and row_date < start_date:
                     continue
                 if end_date and row_date > end_date:
                     continue
             except Exception:
-                # If date parsing fails on a row, we just skip that row entirely
                 continue
-        # ----------------------
 
         try:
             price = parse_price(row[3])
             payer = row[4].strip()
             shared_by_str = row[5].strip()
             amt_str = row[6].strip()
+            settled_str = row[9].strip() if len(row) > 9 else ""
 
-            if not payer or not shared_by_str: 
+            if not payer or not shared_by_str:
                 continue
 
-            # Give the payer back their money
-            balances[payer] = balances.get(payer, 0.0) + price
+            sharers = [s.strip() for s in shared_by_str.split(",") if s.strip()]
+            settled_names = set(s.strip() for s in settled_str.split(",") if s.strip())
 
-            # Deduct the share from everyone involved
-            sharers = [s.strip() for s in shared_by_str.split(",")]
+            # Only count sharers who have NOT settled yet
+            outstanding_sharers = [s for s in sharers if s not in settled_names]
+
+            if not outstanding_sharers:
+                # Everyone has individually settled — skip this row entirely
+                continue
+
             if amt_str != "-":
                 amt_per_person = parse_price(amt_str)
-                for s in sharers:
+                outstanding_total = amt_per_person * len(outstanding_sharers)
+            else:
+                outstanding_total = price
+
+            # Payer is owed back the outstanding amount only
+            balances[payer] = balances.get(payer, 0.0) + outstanding_total
+
+            # Deduct each outstanding sharer's share
+            if amt_str != "-":
+                for s in outstanding_sharers:
                     balances[s] = balances.get(s, 0.0) - amt_per_person
+
         except ValueError:
             continue
 
     debtors = []
     creditors = []
     for name, amount in balances.items():
-        if amount < -10.0:  # Using 10 to ignore tiny decimal rounding errors
+        if amount < -10.0:
             debtors.append([name, abs(amount)])
         elif amount > 10.0:
             creditors.append([name, amount])
@@ -185,13 +217,10 @@ def get_settlement_summary(sheet_name: str, start_date_str=None, end_date_str=No
     while i < len(debtors) and j < len(creditors):
         debtor_name, debt_amt = debtors[i]
         cred_name, cred_amt = creditors[j]
-
         settle_amt = min(debt_amt, cred_amt)
         transactions.append(f"💸 *{debtor_name}* pays *{cred_name}*: {format_price(settle_amt)}")
-
         debtors[i][1] -= settle_amt
         creditors[j][1] -= settle_amt
-
         if debtors[i][1] < 10.0: i += 1
         if creditors[j][1] < 10.0: j += 1
 
@@ -200,11 +229,10 @@ def get_settlement_summary(sheet_name: str, start_date_str=None, end_date_str=No
 
 def get_raw_summary(sheet_name: str, start_date_str=None, end_date_str=None):
     ws = get_or_create_worksheet(sheet_name)
-    data = ws.get_all_values()[1:]  # Skip the header row
+    data = ws.get_all_values()[1:]
     from utils import parse_price, format_price
     from datetime import datetime
 
-    # Parse filter dates if provided
     start_date = None
     end_date = None
     if start_date_str:
@@ -214,45 +242,53 @@ def get_raw_summary(sheet_name: str, start_date_str=None, end_date_str=None):
 
     direct_debts = {}
     for row in data:
-        if len(row) < 7: 
-            continue  # Skip broken/empty rows
-            
+        if len(row) < 7:
+            continue
+
+        # --- Skip fully paid entries ---
+        status = row[8].strip() if len(row) > 8 else ""
+        if status == "✅ Paid":
+            continue
+
         # --- Date Filtering ---
         if start_date or end_date:
             try:
-                row_date_str = row[0].split(" ")[0] 
+                row_date_str = row[0].split(" ")[0]
                 row_date = datetime.strptime(row_date_str, "%d-%m-%Y").date()
-                
                 if start_date and row_date < start_date:
                     continue
                 if end_date and row_date > end_date:
                     continue
             except Exception:
                 continue
-        # ----------------------
 
         try:
             payer = row[4].strip()
             shared_by_str = row[5].strip()
             amt_str = row[6].strip()
+            settled_str = row[9].strip() if len(row) > 9 else ""
 
-            if not payer or not shared_by_str or amt_str == "-": 
+            if not payer or not shared_by_str or amt_str == "-":
                 continue
 
             amt_per_person = parse_price(amt_str)
-            sharers = [s.strip() for s in shared_by_str.split(",")]
-            
+            sharers = [s.strip() for s in shared_by_str.split(",") if s.strip()]
+            settled_names = set(s.strip() for s in settled_str.split(",") if s.strip())
+
             for person in sharers:
+                # Skip if this person has already individually settled
+                if person in settled_names:
+                    continue
                 if person.lower() != payer.lower():
                     debt_pair = (person, payer)
                     direct_debts[debt_pair] = direct_debts.get(debt_pair, 0.0) + amt_per_person
-                    
+
         except ValueError:
             continue
 
     transactions = []
     for (debtor, creditor), amount in direct_debts.items():
-        if amount > 10.0: # Ignore tiny decimal rounding errors
+        if amount > 10.0:
             transactions.append(f"💸 *{debtor}* pays *{creditor}*: {format_price(amount)}")
 
     return transactions
