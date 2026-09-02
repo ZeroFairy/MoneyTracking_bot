@@ -36,11 +36,16 @@ MARKPAID_PAGE_SIZE = 8
 
 HELP_TEXT = (
     "👋 *Expense Tracker Bot*\n\n"
-    "/add — log a personal expense\n"
+    "⚡ *Quick add:*\n"
+    "`/q Place Item Price`\n"
+    "e.g. `/q Indomaret Aqua 5000`\n\n"
+    "📋 *All commands:*\n"
+    "/add — log an expense (step-by-step)\n"
+    "/q — quick add a solo expense in one line\n"
     "/split — split a group bill\n"
     "/summary — calculate who owes whom\n"
     "/totals — total spending per person\n"
-    "/list — browse all entries (with pagination)\n"
+    "/list — browse all entries\n"
     "/delete — delete an entry\n"
     "/markpaid — mark entries paid/unpaid or per-person\n"
     "/sheet — get the spreadsheet link\n"
@@ -48,7 +53,8 @@ HELP_TEXT = (
     "/switch — switch between sheets\n"
     "/setmembers — save group names for quick-select\n"
     "/cancel — cancel the current action\n\n"
-    "💡 Prices: `25000`, `25.000`, or `25k` all work."
+    "💡 Prices: `25000`, `25.000`, or `25k` all work.\n"
+    "💡 `/q` logs you as the payer and sole sharer. Use /add if others are sharing."
 )
 
 
@@ -90,6 +96,68 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data.clear()
     await update.message.reply_text("Cancelled.")
     return ConversationHandler.END
+
+
+QUICKADD_USAGE = (
+    "⚡ *Quick Add usage:*\n"
+    "`/q Place Item Price`\n\n"
+    "*Examples:*\n"
+    "`/q Indomaret Aqua 5000`\n"
+    "`/q Alfamart Indomie 3500`\n"
+    "`/q Resto Nasi Goreng 25000`\n"
+    "`/q Parkir Motor 2k`\n\n"
+    "• First word = place\n"
+    "• Last word = price\n"
+    "• Everything in between = item name\n"
+    "• You are set as payer and sole sharer\n"
+    "• Use /add instead if others are sharing the cost"
+)
+
+
+async def quickadd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Strip the command prefix and get the rest
+    text = update.message.text.strip()
+    raw  = text.split(None, 1)   # split off /q or /quickadd
+
+    if len(raw) < 2 or not raw[1].strip():
+        await update.message.reply_text(QUICKADD_USAGE, parse_mode="Markdown")
+        return
+
+    args = raw[1].strip().split()
+    if len(args) < 3:
+        await update.message.reply_text(
+            "⚠️ Need at least 3 parts: *Place*, *Item*, *Price*\n\n" + QUICKADD_USAGE,
+            parse_mode="Markdown",
+        )
+        return
+
+    place     = args[0]
+    price_raw = args[-1]
+    item      = " ".join(args[1:-1])
+
+    try:
+        price = parse_price(price_raw)
+    except ValueError:
+        await update.message.reply_text(
+            f"⚠️ Couldn't read `{price_raw}` as a price.\n"
+            "Try formats like `5000`, `5.000`, or `5k`.",
+            parse_mode="Markdown",
+        )
+        return
+
+    sender     = update.effective_user.first_name
+    chat_id    = update.effective_chat.id
+    sheet_name = active_sheet_name(chat_id)
+    sheets.append_expense(sheet_name, place, item, price, sender, sender, price)
+    await update.message.reply_text(
+        f"⚡ *Saved!*\n"
+        f"📍 {place} — {item}\n"
+        f"💰 {format_price(price)}  |  🙋 {sender}\n"
+        f"📋 Sheet: {sheet_name}",
+        parse_mode="Markdown",
+    )
+
+
 
 
 async def setmembers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1094,6 +1162,8 @@ def main():
     app.add_handler(CallbackQueryHandler(delete_page_callback,   pattern=r"^delpage:"))
     app.add_handler(CallbackQueryHandler(delete_callback,        pattern=r"^del:"))
     app.add_handler(CallbackQueryHandler(delete_cancel_callback, pattern=r"^delcancel$"))
+    app.add_handler(CommandHandler("q",          restricted(quickadd_cmd)))
+    app.add_handler(CommandHandler("quickadd",   restricted(quickadd_cmd)))
     app.add_handler(CommandHandler("markpaid",   restricted(markpaid_cmd)))
     app.add_handler(CallbackQueryHandler(mk_page,         pattern=r"^mkpage:"))
     app.add_handler(CallbackQueryHandler(mk_pick_entry,   pattern=r"^mk1:"))
