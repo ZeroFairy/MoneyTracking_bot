@@ -53,6 +53,9 @@ HELP_TEXT = (
     "/newevent — create a new sheet for a trip/event\n"
     "/switch — switch between sheets\n"
     "/setmembers — save group names for quick-select\n"
+    "/setreminder HH:MM Message — add a daily reminder at that time\n"
+    "/listreminders — show all your reminders\n"
+    "/stopreminder — remove a reminder\n"
     "/cancel — cancel the current action\n\n"
     "💡 Prices: `25000`, `25.000`, or `25k` all work.\n"
     "💡 `/q` logs you as the payer and sole sharer. Use /add if others are sharing."
@@ -1347,6 +1350,166 @@ async def even_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
+# /setreminder  /listreminders  /stopreminder  — multiple reminders per chat
+# ---------------------------------------------------------------------------
+
+import random
+import datetime
+
+WIB_OFFSET = 7  # WIB = UTC+7
+
+
+async def _send_reminder(context):
+    """Job callback — sends the custom message saved with this reminder."""
+    message = context.job.data.get("message", "⏰ Reminder!")
+    chat_id = context.job.chat_id
+    await context.bot.send_message(chat_id=chat_id, text=message)
+
+
+def _job_name(chat_id: int, reminder_id: str) -> str:
+    return f"reminder_{chat_id}_{reminder_id}"
+
+
+def _schedule_one(app, chat_id: int, reminder: dict):
+    """Schedule a single reminder dict. Replaces existing job with same ID."""
+    jname = _job_name(chat_id, reminder["id"])
+    for job in app.job_queue.get_jobs_by_name(jname):
+        job.schedule_removal()
+    app.job_queue.run_daily(
+        _send_reminder,
+        time=datetime.time(
+            hour=reminder["hour"], minute=reminder["minute"],
+            tzinfo=datetime.timezone.utc,
+        ),
+        chat_id=chat_id,
+        name=jname,
+        data={"message": reminder["message"]},
+    )
+
+
+async def setreminder_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Usage: /setreminder HH:MM Your custom message here"""
+    text  = update.message.text.strip()
+    parts = text.split(None, 2)   # ["/setreminder", "HH:MM", "message..."]
+
+    if len(parts) < 3:
+        await update.message.reply_text(
+            "⏰ *Set a reminder*\n\n"
+            "Usage: `/setreminder HH:MM Your message`\n\n"
+            "*Examples:*\n"
+            "`/setreminder 20:00 Log your expenses!`\n"
+            "`/setreminder 12:00 Did you spend anything this morning?`\n"
+            "`/setreminder 09:00 Weekly budget check`\n\n"
+            "Time is in *WIB (UTC+7)*. You can add as many reminders as you like.",
+            parse_mode="Markdown",
+        )
+        return
+
+    time_str = parts[1]
+    message  = parts[2].strip()
+
+    try:
+        hour_wib, minute = [int(x) for x in time_str.split(":")]
+        if not (0 <= hour_wib <= 23 and 0 <= minute <= 59):
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text(
+            "⚠️ Invalid time. Use HH:MM, e.g. `20:00`.", parse_mode="Markdown"
+        )
+        return
+
+    hour_utc = (hour_wib - WIB_OFFSET) % 24
+    chat_id  = update.effective_chat.id
+
+    rid      = state.add_reminder(chat_id, hour_utc, minute, message)
+    reminder = {"id": rid, "hour": hour_utc, "minute": minute, "message": message}
+    _schedule_one(context.application, chat_id, reminder)
+
+    existing = state.get_reminders(chat_id)
+    await update.message.reply_text(
+        f"✅ Reminder added at *{hour_wib:02d}:{minute:02d} WIB*\n"
+        f"📝 Message: _{message}_\n\n"
+        f"You now have *{len(existing)}* reminder(s). Use /listreminders to see them all.",
+        parse_mode="Markdown",
+    )
+
+
+async def listreminders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id   = update.effective_chat.id
+    reminders = state.get_reminders(chat_id)
+    if not reminders:
+        await update.message.reply_text(
+            "You have no reminders set.\nUse /setreminder to add one."
+        )
+        return
+
+    lines = [f"⏰ *Your reminders ({len(reminders)} total):*\n"]
+    for i, r in enumerate(reminders, 1):
+        hour_wib = (r["hour"] + WIB_OFFSET) % 24
+        lines.append(f"*{i}. {hour_wib:02d}:{r['minute']:02d} WIB*  —  {r['message']}")
+        lines.append(f"    ID: `{r['id']}`")
+    lines.append("\nUse /stopreminder to remove one.")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def stopreminder_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id   = update.effective_chat.id
+    reminders = state.get_reminders(chat_id)
+    if not reminders:
+        await update.message.reply_text("You have no active reminders.")
+        return
+
+    kb = []
+    for r in reminders:
+        hour_wib = (r["hour"] + WIB_OFFSET) % 24
+        label    = f"🗑️ {hour_wib:02d}:{r['minute']:02d} WIB — {r['message'][:35]}"
+        kb.append([InlineKeyboardButton(label, callback_data=f"delrem:{r['id']}")])
+    kb.append([InlineKeyboardButton("🗑️ Remove ALL reminders", callback_data="delrem:__all__")])
+    kb.append([InlineKeyboardButton("❌ Cancel", callback_data="delrem:__cancel__")])
+    await update.message.reply_text(
+        "Which reminder do you want to remove?",
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
+
+
+async def stopreminder_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query   = update.callback_query
+    await query.answer()
+    chat_id = update.effective_chat.id
+    rid     = query.data.split(":", 1)[1]
+
+    if rid == "__cancel__":
+        await query.edit_message_text("Cancelled.")
+        return
+
+    if rid == "__all__":
+        reminders = state.get_reminders(chat_id)
+        for r in reminders:
+            jname = _job_name(chat_id, r["id"])
+            for job in context.application.job_queue.get_jobs_by_name(jname):
+                job.schedule_removal()
+        state.delete_all_reminders(chat_id)
+        await query.edit_message_text("🗑️ All reminders removed.")
+        return
+
+    # Remove single reminder
+    reminders = state.get_reminders(chat_id)
+    target    = next((r for r in reminders if r["id"] == rid), None)
+    if target:
+        jname = _job_name(chat_id, rid)
+        for job in context.application.job_queue.get_jobs_by_name(jname):
+            job.schedule_removal()
+        state.delete_reminder(chat_id, rid)
+        hour_wib = (target["hour"] + WIB_OFFSET) % 24
+        await query.edit_message_text(
+            f"🗑️ Removed: *{hour_wib:02d}:{target['minute']:02d} WIB* — {target['message']}",
+            parse_mode="Markdown",
+        )
+    else:
+        await query.edit_message_text("Reminder not found — it may have already been removed.")
+
+
+# ---------------------------------------------------------------------------
 # Error handler
 # ---------------------------------------------------------------------------
 
@@ -1364,6 +1527,16 @@ def main():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     app = ApplicationBuilder().token(config.TELEGRAM_BOT_TOKEN).build()
+
+    # Restore saved reminders from state.json on startup
+    for chat_id, reminders in state.get_all_reminders().items():
+        for reminder in reminders:
+            try:
+                _schedule_one(app, chat_id, reminder)
+                hour_wib = (reminder["hour"] + WIB_OFFSET) % 24
+                logger.info(f"Restored reminder for chat {chat_id} at {hour_wib:02d}:{reminder['minute']:02d} WIB")
+            except Exception as e:
+                logger.warning(f"Could not restore reminder {reminder.get('id')} for chat {chat_id}: {e}")
 
     app.add_handler(CommandHandler("start",      restricted(start_cmd)))
     app.add_handler(CommandHandler("help",       restricted(start_cmd)))
@@ -1387,7 +1560,11 @@ def main():
     app.add_handler(CallbackQueryHandler(mk_cancel,       pattern=r"^mkcancel$"))
     app.add_handler(CommandHandler("switch",     restricted(switch_cmd)))
     app.add_handler(CallbackQueryHandler(switch_callback, pattern=r"^switch:"))
-    app.add_handler(CommandHandler("setmembers", restricted(setmembers_cmd)))
+    app.add_handler(CommandHandler("setreminder",   restricted(setreminder_cmd)))
+    app.add_handler(CommandHandler("listreminders", restricted(listreminders_cmd)))
+    app.add_handler(CommandHandler("stopreminder",  restricted(stopreminder_cmd)))
+    app.add_handler(CallbackQueryHandler(stopreminder_callback, pattern=r"^delrem:"))
+    app.add_handler(CommandHandler("setmembers",   restricted(setmembers_cmd)))
 
     edit_conv = ConversationHandler(
         entry_points=[CommandHandler("edit", restricted(edit_start))],
