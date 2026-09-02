@@ -43,12 +43,13 @@ HELP_TEXT = (
     "/add — log an expense (step-by-step)\n"
     "/q — quick add a solo expense in one line\n"
     "/split — split a group bill\n"
+    "/edit — edit an existing entry\n"
     "/summary — calculate who owes whom\n"
     "/totals — total spending per person\n"
     "/list — browse all entries\n"
     "/delete — delete an entry\n"
     "/markpaid — mark entries paid/unpaid or per-person\n"
-    "/sheet — get the spreadsheet link\n"
+    "/getlink — get the spreadsheet link\n"
     "/newevent — create a new sheet for a trip/event\n"
     "/switch — switch between sheets\n"
     "/setmembers — save group names for quick-select\n"
@@ -82,13 +83,16 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP_TEXT, parse_mode="Markdown")
 
 
-async def sheet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def getlink_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    name = active_sheet_name(chat_id)
-    url = sheets.sheet_url(name)
+    name    = active_sheet_name(chat_id)
+    tab_url   = sheets.sheet_url(name)
+    sheet_url = sheets.spreadsheet_url()
     await update.message.reply_text(
-        f"📊 Active sheet: *{name}*\n{url}\n\nFull spreadsheet:\n{sheets.spreadsheet_url()}",
-        parse_mode="Markdown",
+        f"📊 Active sheet: {name}\n"
+        f"{tab_url}\n\n"
+        f"Full spreadsheet:\n"
+        f"{sheet_url}"
     )
 
 
@@ -170,6 +174,214 @@ async def setmembers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     names = [n.strip() for n in text.split(",") if n.strip()]
     state.set_members(update.effective_chat.id, names)
     await update.message.reply_text(f"✅ Saved {len(names)} members: {', '.join(names)}")
+
+
+# ---------------------------------------------------------------------------
+# /edit  — edit a field in an existing entry
+# ---------------------------------------------------------------------------
+
+EDIT_PICK, EDIT_FIELD, EDIT_VALUE = range(23, 26)
+EDIT_PAGE_SIZE = 8
+
+# Maps field key → (display label, column number, needs price parsing)
+EDIT_FIELDS = {
+    "place":      ("📍 Place",          2, False),
+    "item":       ("📝 Item",           3, False),
+    "price":      ("💰 Price",          4, True),
+    "paid_by":    ("🙋 Paid By",        5, False),
+    "shared":     ("👥 Shared By",      6, False),
+    "per_person": ("💵 Amount/Person",  7, True),
+}
+
+
+def _edit_entry_keyboard(all_rows, page):
+    total_pages = max(1, -(-len(all_rows) // EDIT_PAGE_SIZE))
+    page_rows   = all_rows[page * EDIT_PAGE_SIZE:(page + 1) * EDIT_PAGE_SIZE]
+    kb = []
+    for row_num, row in page_rows:
+        item  = row[2] if len(row) > 2 else "?"
+        price = row[3] if len(row) > 3 else "?"
+        kb.append([InlineKeyboardButton(
+            f"✏️ #{row_num} {item} ({price})",
+            callback_data=f"editpick:{row_num}"
+        )])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀ Newer", callback_data=f"editpage:{page - 1}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("Older ▶", callback_data=f"editpage:{page + 1}"))
+    if nav:
+        kb.append(nav)
+    kb.append([InlineKeyboardButton("❌ Cancel", callback_data="editcancel")])
+    return InlineKeyboardMarkup(kb), total_pages
+
+
+def _edit_field_keyboard(row_num, row):
+    """Show the current values and let user pick which field to edit."""
+    kb = []
+    field_values = {
+        "place":      row[1] if len(row) > 1 else "?",
+        "item":       row[2] if len(row) > 2 else "?",
+        "price":      row[3] if len(row) > 3 else "?",
+        "paid_by":    row[4] if len(row) > 4 else "?",
+        "shared":     row[5] if len(row) > 5 else "?",
+        "per_person": row[6] if len(row) > 6 else "?",
+    }
+    for key, (label, _, _) in EDIT_FIELDS.items():
+        current = field_values[key]
+        kb.append([InlineKeyboardButton(
+            f"{label}: {current}",
+            callback_data=f"editfield:{row_num}:{key}"
+        )])
+    kb.append([InlineKeyboardButton("🔙 Back",    callback_data="editback"),
+               InlineKeyboardButton("❌ Cancel",  callback_data="editcancel")])
+    return InlineKeyboardMarkup(kb)
+
+
+async def edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id  = update.effective_chat.id
+    name     = active_sheet_name(chat_id)
+    all_rows = sheets.get_all_expenses(name)
+    if not all_rows:
+        await update.message.reply_text(f"No entries yet in *{name}*.", parse_mode="Markdown")
+        return ConversationHandler.END
+    context.chat_data["edit_sheet"] = name
+    context.chat_data["edit_rows"]  = all_rows
+    context.chat_data["edit_page"]  = 0
+    kb, total_pages = _edit_entry_keyboard(all_rows, 0)
+    await update.message.reply_text(
+        f"✏️ *Edit an entry* — *{name}*\nPage 1/{total_pages}",
+        parse_mode="Markdown", reply_markup=kb,
+    )
+    return EDIT_PICK
+
+
+async def edit_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query    = update.callback_query
+    await query.answer()
+    page     = int(query.data.split(":")[1])
+    all_rows = context.chat_data.get("edit_rows", [])
+    name     = context.chat_data.get("edit_sheet", "")
+    if not all_rows:
+        all_rows = sheets.get_all_expenses(name)
+        context.chat_data["edit_rows"] = all_rows
+    context.chat_data["edit_page"] = page
+    kb, total_pages = _edit_entry_keyboard(all_rows, page)
+    await query.edit_message_text(
+        f"✏️ *Edit an entry* — *{name}*\nPage {page + 1}/{total_pages}",
+        parse_mode="Markdown", reply_markup=kb,
+    )
+    return EDIT_PICK
+
+
+async def edit_pick_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User tapped an entry — show field picker."""
+    query   = update.callback_query
+    await query.answer()
+    row_num = int(query.data.split(":")[1])
+    rows    = context.chat_data.get("edit_rows", [])
+    chosen  = next((r for rn, r in rows if rn == row_num), None)
+    if chosen is None:
+        await query.edit_message_text("Entry not found. Try /edit again.")
+        return ConversationHandler.END
+    context.chat_data["edit_row_num"] = row_num
+    context.chat_data["edit_row"]     = chosen
+    item  = chosen[2] if len(chosen) > 2 else "?"
+    price = chosen[3] if len(chosen) > 3 else "?"
+    kb    = _edit_field_keyboard(row_num, chosen)
+    await query.edit_message_text(
+        f"✏️ *#{row_num} — {item}* ({price})\nTap a field to edit it:",
+        parse_mode="Markdown", reply_markup=kb,
+    )
+    return EDIT_FIELD
+
+
+async def edit_pick_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User picked a field — ask for the new value."""
+    query   = update.callback_query
+    await query.answer()
+    parts   = query.data.split(":", 2)   # editfield:ROWNUM:FIELDKEY
+    row_num = int(parts[1])
+    field   = parts[2]
+    label, _, needs_price = EDIT_FIELDS[field]
+    context.chat_data["edit_field"] = field
+    hint = " (e.g. 25000 or 25k)" if needs_price else ""
+    row     = context.chat_data.get("edit_row", [])
+    field_values = {
+        "place": row[1], "item": row[2], "price": row[3],
+        "paid_by": row[4], "shared": row[5], "per_person": row[6],
+    }
+    current = field_values.get(field, "?") if len(row) > 6 else "?"
+    await query.edit_message_text(
+        f"✏️ Editing *{label}* for entry #{row_num}\n"
+        f"Current value: `{current}`\n\n"
+        f"Type the new value{hint}:",
+        parse_mode="Markdown",
+    )
+    return EDIT_VALUE
+
+
+async def edit_save_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User typed a new value — validate and save."""
+    raw_value = update.message.text.strip()
+    field     = context.chat_data.get("edit_field", "")
+    row_num   = context.chat_data.get("edit_row_num")
+    name      = context.chat_data.get("edit_sheet", "")
+    label, _, needs_price = EDIT_FIELDS[field]
+
+    if needs_price:
+        try:
+            parsed = parse_price(raw_value)
+            save_value = format_price(parsed)
+        except ValueError:
+            await update.message.reply_text(
+                f"⚠️ Couldn't read that as a price. Try `25000`, `25.000`, or `25k`."
+            )
+            return EDIT_VALUE
+    else:
+        save_value = raw_value
+
+    sheets.update_expense_field(name, row_num, field, save_value)
+
+    # Clean up
+    for k in ("edit_sheet", "edit_rows", "edit_page", "edit_row_num", "edit_row", "edit_field"):
+        context.chat_data.pop(k, None)
+
+    await update.message.reply_text(
+        f"✅ *Updated!*\n{label} → `{save_value}`\n_(row #{row_num} in {name})_",
+        parse_mode="Markdown",
+    )
+    return ConversationHandler.END
+
+
+async def edit_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Go back to entry list from field picker."""
+    query    = update.callback_query
+    await query.answer()
+    all_rows = context.chat_data.get("edit_rows", [])
+    name     = context.chat_data.get("edit_sheet", "")
+    page     = context.chat_data.get("edit_page", 0)
+    context.chat_data.pop("edit_row_num", None)
+    context.chat_data.pop("edit_row",     None)
+    context.chat_data.pop("edit_field",   None)
+    if not all_rows:
+        all_rows = sheets.get_all_expenses(name)
+        context.chat_data["edit_rows"] = all_rows
+    kb, total_pages = _edit_entry_keyboard(all_rows, page)
+    await query.edit_message_text(
+        f"✏️ *Edit an entry* — *{name}*\nPage {page + 1}/{total_pages}",
+        parse_mode="Markdown", reply_markup=kb,
+    )
+    return EDIT_PICK
+
+
+async def edit_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    for k in ("edit_sheet", "edit_rows", "edit_page", "edit_row_num", "edit_row", "edit_field"):
+        context.chat_data.pop(k, None)
+    await query.edit_message_text("Cancelled.")
+    return ConversationHandler.END
 
 
 # ---------------------------------------------------------------------------
@@ -1155,7 +1367,8 @@ def main():
 
     app.add_handler(CommandHandler("start",      restricted(start_cmd)))
     app.add_handler(CommandHandler("help",       restricted(start_cmd)))
-    app.add_handler(CommandHandler("sheet",      restricted(sheet_cmd)))
+    app.add_handler(CommandHandler("getlink",    restricted(getlink_cmd)))
+    app.add_handler(CommandHandler("sheet",      restricted(getlink_cmd)))  # keep old name as alias
     app.add_handler(CommandHandler("list",       restricted(list_cmd)))
     app.add_handler(CallbackQueryHandler(list_page_callback, pattern=r"^listpage:"))
     app.add_handler(CommandHandler("delete",     restricted(delete_cmd)))
@@ -1175,6 +1388,27 @@ def main():
     app.add_handler(CommandHandler("switch",     restricted(switch_cmd)))
     app.add_handler(CallbackQueryHandler(switch_callback, pattern=r"^switch:"))
     app.add_handler(CommandHandler("setmembers", restricted(setmembers_cmd)))
+
+    edit_conv = ConversationHandler(
+        entry_points=[CommandHandler("edit", restricted(edit_start))],
+        states={
+            EDIT_PICK:  [
+                CallbackQueryHandler(edit_page,       pattern=r"^editpage:"),
+                CallbackQueryHandler(edit_pick_entry, pattern=r"^editpick:"),
+                CallbackQueryHandler(edit_cancel,     pattern=r"^editcancel$"),
+            ],
+            EDIT_FIELD: [
+                CallbackQueryHandler(edit_pick_field, pattern=r"^editfield:"),
+                CallbackQueryHandler(edit_back,       pattern=r"^editback$"),
+                CallbackQueryHandler(edit_cancel,     pattern=r"^editcancel$"),
+            ],
+            EDIT_VALUE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_save_value),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_cmd)],
+    )
+    app.add_handler(edit_conv)
 
     add_conv = ConversationHandler(
         entry_points=[CommandHandler("add", restricted(add_start))],

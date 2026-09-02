@@ -116,13 +116,35 @@ def set_settled_by(sheet_name: str, row_num: int, names: list):
     ws.update_cell(row_num, SETTLED_COL, ", ".join(names))
 
 
-def sheet_url(sheet_name):
+# Column numbers for editable fields (1-indexed)
+FIELD_COLS = {
+    "place":      2,
+    "item":       3,
+    "price":      4,
+    "paid_by":    5,
+    "shared":     6,
+    "per_person": 7,
+}
+
+
+def update_expense_field(sheet_name: str, row_num: int, field: str, value: str):
+    """Update a single field in an expense row."""
+    col = FIELD_COLS.get(field)
+    if col is None:
+        raise ValueError(f"Unknown field: {field}")
     ws = get_or_create_worksheet(sheet_name)
-    return f"{_spreadsheet().url}#gid={ws.id}"
+    ws.update_cell(row_num, col, value)
+
+
+def sheet_url(sheet_name):
+    ws  = get_or_create_worksheet(sheet_name)
+    sid = _spreadsheet().id
+    return f"https://docs.google.com/spreadsheets/d/{sid}/edit#gid={ws.id}"
 
 
 def spreadsheet_url():
-    return _spreadsheet().url
+    sid = _spreadsheet().id
+    return f"https://docs.google.com/spreadsheets/d/{sid}/edit"
 
 
 def get_settlement_summary(sheet_name: str, start_date_str=None, end_date_str=None):
