@@ -100,6 +100,12 @@ def active_sheet_name(chat_id: int) -> str:
     return name if name else sheets.current_month_sheet_name()
 
 
+def _disp(row_num: int) -> int:
+    """Convert an actual sheet row number (row 1 = header, row 2 = first entry)
+    into a friendly 1-based entry number shown to the user."""
+    return row_num - 1
+
+
 def restricted(func):
     @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *a, **kw):
@@ -281,7 +287,7 @@ def _edit_entry_keyboard(all_rows, page):
         item  = row[2] if len(row) > 2 else "?"
         price = row[3] if len(row) > 3 else "?"
         kb.append([InlineKeyboardButton(
-            f"✏️ #{row_num} {item} ({price})",
+            f"✏️ #{_disp(row_num)} {item} ({price})",
             callback_data=f"editpick:{row_num}"
         )])
     nav = []
@@ -371,7 +377,7 @@ async def edit_pick_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     price = chosen[3] if len(chosen) > 3 else "?"
     kb    = _edit_field_keyboard(row_num, chosen)
     await query.edit_message_text(
-        f"✏️ *#{row_num} — {item}* ({price})\nTap a field to edit it:",
+        f"✏️ *#{_disp(row_num)} — {item}* ({price})\nTap a field to edit it:",
         parse_mode="Markdown", reply_markup=kb,
     )
     return EDIT_FIELD
@@ -405,7 +411,7 @@ async def edit_pick_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     current = field_values.get(field, "?") if len(row) > 6 else "?"
     await query.edit_message_text(
-        f"✏️ Editing *{label}* for entry #{row_num}\n"
+        f"✏️ Editing *{label}* for entry #{_disp(row_num)}\n"
         f"Current value: `{current}`\n\n"
         f"Type the new value{hint}:",
         parse_mode="Markdown",
@@ -448,7 +454,7 @@ async def edit_save_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.chat_data.pop(k, None)
 
     await update.message.reply_text(
-        f"✅ *Updated!*\n{label} → `{save_value}`\n_(row #{row_num} in {name})_",
+        f"✅ *Updated!*\n{label} → `{save_value}`\n_(entry #{_disp(row_num)} in {name})_",
         parse_mode="Markdown",
     )
     return ConversationHandler.END
@@ -499,7 +505,7 @@ def _list_row_text(row_num, row):
     status  = row[8] if len(row) > 8 and row[8] else "⏳ Unpaid"
     settled = row[9] if len(row) > 9 and row[9] else ""
     return (
-        f"*#{row_num} — {item}*\n"
+        f"*#{_disp(row_num)} — {item}*\n"
         f"📍 {place}  |  💰 {price}  |  {status}\n"
         f"🙋 Paid by: {paid_by}\n"
         f"👥 Shared: {shared}  ({per_p}/person)\n"
@@ -572,7 +578,7 @@ def _delete_keyboard(all_rows, page, name):
     for row_num, row in page_rows:
         item  = row[2] if len(row) > 2 else "?"
         price = row[3] if len(row) > 3 else "?"
-        kb.append([InlineKeyboardButton(f"🗑️ #{row_num} {item} ({price})", callback_data=f"del:{name}:{row_num}")])
+        kb.append([InlineKeyboardButton(f"🗑️ #{_disp(row_num)} {item} ({price})", callback_data=f"del:{name}:{row_num}")])
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton("◀ Newer", callback_data=f"delpage:{page - 1}"))
@@ -626,7 +632,7 @@ async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Invalidate cached rows since row numbers have shifted
     context.chat_data.pop("del_rows",  None)
     context.chat_data.pop("del_sheet", None)
-    await query.edit_message_text(f"🗑️ Deleted row #{row_num} from *{name}*.", parse_mode="Markdown")
+    await query.edit_message_text(f"🗑️ Deleted entry #{_disp(int(row_num))} from *{name}*.", parse_mode="Markdown")
 
 
 async def delete_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -660,8 +666,8 @@ def _entry_label(row_num, row):
         names   = [n.strip() for n in row[5].split(",") if n.strip()]
         s_names = [n.strip() for n in settled.split(",") if n.strip()]
         badge   = f" ({len(s_names)}/{len(names)} settled)"
-        return f"{s_icon} #{row_num} {item} ({price}){badge} 👥"
-    return f"{s_icon} #{row_num} {item} ({price})"
+        return f"{s_icon} #{_disp(row_num)} {item} ({price}){badge} 👥"
+    return f"{s_icon} #{_disp(row_num)} {item} ({price})"
 
 
 def _markpaid_keyboard(all_rows, page):
@@ -772,7 +778,7 @@ async def mk_pick_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = _build_people_keyboard(row_num, names, s_names)
         s_icon = "✅" if status == "✅ Paid" else "⏳"
         await query.edit_message_text(
-            f"{s_icon} *#{row_num} — {item}* ({price})\n"
+            f"{s_icon} *#{_disp(row_num)} — {item}* ({price})\n"
             f"Tap each person to toggle ✅/⏳, then Save:",
             parse_mode="Markdown", reply_markup=kb,
         )
@@ -780,7 +786,7 @@ async def mk_pick_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = _build_solo_keyboard(row_num, status)
         s_icon = "✅" if status == "✅ Paid" else "⏳"
         await query.edit_message_text(
-            f"{s_icon} *#{row_num} — {item}* ({price})\nCurrently: *{status}*",
+            f"{s_icon} *#{_disp(row_num)} — {item}* ({price})\nCurrently: *{status}*",
             parse_mode="Markdown", reply_markup=kb,
         )
 
@@ -794,7 +800,7 @@ async def mk_solo_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     emoji = "✅" if new_status == "✅ Paid" else "⏳"
     _mk_cleanup(context)
     await query.edit_message_text(
-        f"{emoji} Row *#{row_num}* marked as *{new_status}*.", parse_mode="Markdown"
+        f"{emoji} Entry *#{_disp(row_num)}* marked as *{new_status}*.", parse_mode="Markdown"
     )
 
 
@@ -842,7 +848,7 @@ async def mk_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         summary = f"✅ Settled: {', '.join(ordered)}\n⏳ Still owes: {', '.join(remaining)}"
     _mk_cleanup(context)
-    await query.edit_message_text(f"💾 *Saved — #{row_num}*\n{summary}", parse_mode="Markdown")
+    await query.edit_message_text(f"💾 *Saved — #{_disp(row_num)}*\n{summary}", parse_mode="Markdown")
 
 
 async def mk_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
