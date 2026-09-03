@@ -28,16 +28,25 @@ def format_price(value) -> str:
     return "Rp" + format(round(float(value)), ",").replace(",", ".")
 
 
+WIB_OFFSET_HOURS = 7  # WIB = UTC+7
+
+
+def now_wib():
+    """Current time in WIB (UTC+7), regardless of the server's own timezone."""
+    from datetime import datetime, timezone, timedelta
+    return datetime.now(timezone.utc) + timedelta(hours=WIB_OFFSET_HOURS)
+
+
 def parse_date_input(raw: str) -> str:
     """Parse a user-supplied date into a 'DD-MM-YYYY HH:MM' timestamp string.
 
     Accepts: "today", "now", "yesterday", or an explicit "DD-MM-YYYY" date.
-    The current time-of-day is always used (only the date itself is customizable).
+    The current WIB time-of-day is always used (only the date itself is customizable).
     """
     from datetime import datetime, timedelta
 
     s = raw.strip().lower()
-    now = datetime.now()
+    now = now_wib()
 
     if s in ("today", "now"):
         date_part = now.date()

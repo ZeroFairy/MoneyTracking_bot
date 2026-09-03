@@ -26,7 +26,8 @@ def _spreadsheet():
 
 
 def current_month_sheet_name() -> str:
-    return datetime.now().strftime("%b %Y")
+    from utils import now_wib
+    return now_wib().strftime("%b %Y")
 
 
 def sanitize_sheet_name(name: str) -> str:
@@ -55,7 +56,8 @@ def list_sheet_titles():
 
 def append_expense(sheet_name, place, item, price, paid_by, shared_by, amount_per_person, picture="-", status="⏳ Unpaid", category="", date_str=None):
     ws = get_or_create_worksheet(sheet_name)
-    ts = date_str if date_str else datetime.now().strftime("%d-%m-%Y %H:%M")
+    from utils import now_wib
+    ts = date_str if date_str else now_wib().strftime("%d-%m-%Y %H:%M")
     from utils import format_price
     ws.append_row(
         [ts, place, item, format_price(price), paid_by, shared_by,

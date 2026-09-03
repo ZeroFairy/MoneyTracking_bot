@@ -227,7 +227,7 @@ async def quickadd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sender     = update.effective_user.first_name
     chat_id    = update.effective_chat.id
     sheet_name = active_sheet_name(chat_id)
-    sheets.append_expense(sheet_name, place, item, price, sender, sender, price, category=category, date_str=date_str)
+    sheets.append_expense(sheet_name, place, item, price, sender, sender, price, status="✅ Paid", category=category, date_str=date_str)
     cat_line  = f"  🏷️ {category}" if category else ""
     date_line = f"\n📅 {date_str.split(' ')[0]}" if date_str else ""
     await update.message.reply_text(
