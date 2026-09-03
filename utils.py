@@ -38,24 +38,43 @@ def now_wib():
 
 
 def parse_date_input(raw: str) -> str:
-    """Parse a user-supplied date into a 'DD-MM-YYYY HH:MM' timestamp string.
+    """Parse a user-supplied date (and optional time) into a 'DD-MM-YYYY HH:MM' string.
 
-    Accepts: "today", "now", "yesterday", or an explicit "DD-MM-YYYY" date.
-    The current WIB time-of-day is always used (only the date itself is customizable).
+    Date part accepts: "today", "now", "yesterday", or an explicit "DD-MM-YYYY".
+    An optional second token gives the time as "HH:MM" — if omitted, the current
+    WIB time-of-day is used. Examples: "today", "yesterday 09:00", "25-06-2026",
+    "25-06-2026 14:30".
     """
     from datetime import datetime, timedelta
 
-    s = raw.strip().lower()
+    parts = raw.strip().split()
+    if not parts:
+        raise ValueError(f"Could not parse date from: {raw!r}")
+
+    date_token = parts[0].lower()
+    time_token = parts[1] if len(parts) > 1 else None
     now = now_wib()
 
-    if s in ("today", "now"):
+    if date_token in ("today", "now"):
         date_part = now.date()
-    elif s == "yesterday":
+    elif date_token == "yesterday":
         date_part = (now - timedelta(days=1)).date()
     else:
         try:
-            date_part = datetime.strptime(raw.strip(), "%d-%m-%Y").date()
+            date_part = datetime.strptime(parts[0], "%d-%m-%Y").date()
         except ValueError:
             raise ValueError(f"Could not parse date from: {raw!r}")
 
-    return f"{date_part.strftime('%d-%m-%Y')} {now.strftime('%H:%M')}"
+    if time_token:
+        try:
+            hh_str, mm_str = time_token.split(":")
+            hh, mm = int(hh_str), int(mm_str)
+            if not (0 <= hh <= 23 and 0 <= mm <= 59):
+                raise ValueError
+        except ValueError:
+            raise ValueError(f"Could not parse time from: {time_token!r}")
+        time_str = f"{hh:02d}:{mm:02d}"
+    else:
+        time_str = now.strftime("%H:%M")
+
+    return f"{date_part.strftime('%d-%m-%Y')} {time_str}"

@@ -395,7 +395,7 @@ async def edit_pick_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if needs_price:
         hint = " (e.g. 25000 or 25k)"
     elif field == "date":
-        hint = " (e.g. 25-06-2026, or `today` / `yesterday`)"
+        hint = " (e.g. 25-06-2026 or 25-06-2026 14:30, or `today` / `yesterday`)"
     else:
         hint = ""
     row     = context.chat_data.get("edit_row", [])
@@ -441,7 +441,7 @@ async def edit_save_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save_value = parse_date_input(raw_value)
         except ValueError:
             await update.message.reply_text(
-                "⚠️ Couldn't read that as a date. Try `25-06-2026`, `today`, or `yesterday`."
+                "⚠️ Couldn't read that as a date. Try `25-06-2026`, `25-06-2026 14:30`, `today`, or `yesterday`."
             )
             return EDIT_VALUE
     else:
@@ -1208,7 +1208,11 @@ async def add_date_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     value = query.data.split(":", 1)[1]
     if value == "__custom__":
-        await query.edit_message_text("✍️ Type the date (e.g. `25-06-2026`):", parse_mode="Markdown")
+        await query.edit_message_text(
+            "✍️ Type the date, optionally with a time:\n"
+            "`25-06-2026` or `25-06-2026 14:30`",
+            parse_mode="Markdown",
+        )
         return ADD_DATE
     context.chat_data["draft"]["date_str"] = parse_date_input(value)
     return await _show_add_confirm(update.effective_chat.id, context, query.message, edit=True)
@@ -1220,7 +1224,7 @@ async def add_date_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.chat_data["draft"]["date_str"] = parse_date_input(raw)
     except ValueError:
         await update.message.reply_text(
-            "⚠️ Couldn't read that date. Try `25-06-2026`, `today`, or `yesterday`.",
+            "⚠️ Couldn't read that date. Try `25-06-2026`, `25-06-2026 14:30`, `today`, or `yesterday`.",
             parse_mode="Markdown",
         )
         return ADD_DATE
