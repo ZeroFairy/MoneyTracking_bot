@@ -5,7 +5,7 @@ import gspread
 
 from config import GOOGLE_CREDENTIALS_FILE, GOOGLE_SHEETS_ID
 
-HEADERS = ["Date & Time", "Place", "Buying List", "Price", "Paid By", "Shared By", "Amount/Person", "Picture", "Status", "Settled By"]
+HEADERS = ["Date & Time", "Place", "Buying List", "Price", "Paid By", "Shared By", "Amount/Person", "Picture", "Status", "Settled By", "Category"]
 
 _gc = None
 _sh = None
@@ -53,14 +53,14 @@ def list_sheet_titles():
     return [ws.title for ws in _spreadsheet().worksheets()]
 
 
-def append_expense(sheet_name, place, item, price, paid_by, shared_by, amount_per_person, picture="-", status="⏳ Unpaid"):
+def append_expense(sheet_name, place, item, price, paid_by, shared_by, amount_per_person, picture="-", status="⏳ Unpaid", category=""):
     ws = get_or_create_worksheet(sheet_name)
     ts = datetime.now().strftime("%d-%m-%Y %H:%M")
     from utils import format_price
     ws.append_row(
         [ts, place, item, format_price(price), paid_by, shared_by,
          format_price(amount_per_person) if amount_per_person is not None else "-",
-         picture, status, ""],
+         picture, status, "", category],
         value_input_option="USER_ENTERED",
     )
     return ws
@@ -87,7 +87,8 @@ def delete_row(sheet_name, row_num: int):
 
 
 STATUS_COL  = 9   # 1-indexed — "Status"
-SETTLED_COL = 10  # 1-indexed — "Settled By"
+SETTLED_COL  = 10  # 1-indexed — "Settled By"
+CATEGORY_COL = 11  # 1-indexed — "Category"
 
 
 def toggle_paid_status(sheet_name: str, row_num: int) -> str:
@@ -311,3 +312,44 @@ def get_person_totals(sheet_name: str, start_date_str=None, end_date_str=None):
             continue
 
     return totals
+
+
+def get_category_overview(sheet_name: str, start_date_str=None, end_date_str=None):
+    """Total spending broken down by category.
+    Returns {category: {"total": float, "count": int}} sorted by total desc.
+    """
+    ws = get_or_create_worksheet(sheet_name)
+    data = ws.get_all_values()[1:]
+    from utils import parse_price
+    from datetime import datetime
+
+    start_date = end_date = None
+    if start_date_str:
+        start_date = datetime.strptime(start_date_str, "%d-%m-%Y").date()
+    if end_date_str:
+        end_date = datetime.strptime(end_date_str, "%d-%m-%Y").date()
+
+    cats = {}
+    for row in data:
+        if len(row) < 4 or not any(row):
+            continue
+        if start_date or end_date:
+            try:
+                row_date = datetime.strptime(row[0].split(" ")[0], "%d-%m-%Y").date()
+                if start_date and row_date < start_date:
+                    continue
+                if end_date and row_date > end_date:
+                    continue
+            except Exception:
+                continue
+        try:
+            price    = parse_price(row[3])
+            category = row[10].strip() if len(row) > 10 and row[10].strip() else "Uncategorized"
+            if category not in cats:
+                cats[category] = {"total": 0.0, "count": 0}
+            cats[category]["total"] += price
+            cats[category]["count"] += 1
+        except ValueError:
+            continue
+
+    return dict(sorted(cats.items(), key=lambda x: x[1]["total"], reverse=True))

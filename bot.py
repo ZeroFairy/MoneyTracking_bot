@@ -31,8 +31,39 @@ NEWEVENT_NAME = 5
 ) = range(6, 18)
 SUMMARY_MODE, SUMMARY_SCOPE, SUMMARY_DATE_INPUT = range(18, 21)
 
-LIST_PAGE_SIZE   = 5
+ADD_CATEGORY   = 26
+SPLIT_CATEGORY = 27
+EVEN_CATEGORY  = 28
+OVERVIEW_SCOPE, OVERVIEW_DATE_INPUT = range(29, 31)
+
+LIST_PAGE_SIZE    = 5
 MARKPAID_PAGE_SIZE = 8
+
+PRESET_CATEGORIES = [
+    ("🍔 Food & Drink",     "Food & Drink"),
+    ("🚗 Transport",         "Transport"),
+    ("🛍️ Shopping",          "Shopping"),
+    ("🏠 Household",         "Household"),
+    ("💊 Health",            "Health"),
+    ("🎮 Entertainment",     "Entertainment"),
+    ("📱 Bills & Utilities", "Bills & Utilities"),
+    ("📦 Other",             "Other"),
+]
+
+
+def _category_keyboard(callback_prefix: str = "cat"):
+    """Inline keyboard with preset category buttons + custom option."""
+    kb = []
+    row = []
+    for label, value in PRESET_CATEGORIES:
+        row.append(InlineKeyboardButton(label, callback_data=f"{callback_prefix}:{value}"))
+        if len(row) == 2:
+            kb.append(row)
+            row = []
+    if row:
+        kb.append(row)
+    kb.append([InlineKeyboardButton("✍️ Type a custom category...", callback_data=f"{callback_prefix}:__custom__")])
+    return InlineKeyboardMarkup(kb)
 
 HELP_TEXT = (
     "👋 *Expense Tracker Bot*\n\n"
@@ -46,6 +77,7 @@ HELP_TEXT = (
     "/edit — edit an existing entry\n"
     "/summary — calculate who owes whom\n"
     "/totals — total spending per person\n"
+    "/overview — spending breakdown by category\n"
     "/list — browse all entries\n"
     "/delete — delete an entry\n"
     "/markpaid — mark entries paid/unpaid or per-person\n"
@@ -107,24 +139,25 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 QUICKADD_USAGE = (
     "⚡ *Quick Add usage:*\n"
-    "`/q Place Item Price`\n\n"
+    "`/q Place Item Price`\n"
+    "`/q Place Item Price #category`\n\n"
     "*Examples:*\n"
     "`/q Indomaret Aqua 5000`\n"
-    "`/q Alfamart Indomie 3500`\n"
-    "`/q Resto Nasi Goreng 25000`\n"
+    "`/q Alfamart Indomie 3500 #food`\n"
+    "`/q Grab Motor 15000 #transport`\n"
     "`/q Parkir Motor 2k`\n\n"
     "• First word = place\n"
-    "• Last word = price\n"
+    "• Last word = price (or #tag, then price before it)\n"
     "• Everything in between = item name\n"
+    "• Add `#tag` at the end to set a category (optional)\n"
     "• You are set as payer and sole sharer\n"
     "• Use /add instead if others are sharing the cost"
 )
 
 
 async def quickadd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Strip the command prefix and get the rest
     text = update.message.text.strip()
-    raw  = text.split(None, 1)   # split off /q or /quickadd
+    raw  = text.split(None, 1)
 
     if len(raw) < 2 or not raw[1].strip():
         await update.message.reply_text(QUICKADD_USAGE, parse_mode="Markdown")
@@ -137,6 +170,18 @@ async def quickadd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
         return
+
+    # Check if last arg is a #category tag
+    category = ""
+    if args[-1].startswith("#"):
+        category = args[-1][1:].replace("_", " ").strip()
+        args = args[:-1]
+        if len(args) < 3:
+            await update.message.reply_text(
+                "⚠️ Need at least 3 parts before the #tag: *Place*, *Item*, *Price*\n\n" + QUICKADD_USAGE,
+                parse_mode="Markdown",
+            )
+            return
 
     place     = args[0]
     price_raw = args[-1]
@@ -155,11 +200,12 @@ async def quickadd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sender     = update.effective_user.first_name
     chat_id    = update.effective_chat.id
     sheet_name = active_sheet_name(chat_id)
-    sheets.append_expense(sheet_name, place, item, price, sender, sender, price)
+    sheets.append_expense(sheet_name, place, item, price, sender, sender, price, category=category)
+    cat_line = f"  🏷️ {category}" if category else ""
     await update.message.reply_text(
         f"⚡ *Saved!*\n"
         f"📍 {place} — {item}\n"
-        f"💰 {format_price(price)}  |  🙋 {sender}\n"
+        f"💰 {format_price(price)}  |  🙋 {sender}{cat_line}\n"
         f"📋 Sheet: {sheet_name}",
         parse_mode="Markdown",
     )
@@ -194,6 +240,7 @@ EDIT_FIELDS = {
     "paid_by":    ("🙋 Paid By",        5, False),
     "shared":     ("👥 Shared By",      6, False),
     "per_person": ("💵 Amount/Person",  7, True),
+    "category":   ("🏷️ Category",      11, False),
 }
 
 
@@ -223,12 +270,13 @@ def _edit_field_keyboard(row_num, row):
     """Show the current values and let user pick which field to edit."""
     kb = []
     field_values = {
-        "place":      row[1] if len(row) > 1 else "?",
-        "item":       row[2] if len(row) > 2 else "?",
-        "price":      row[3] if len(row) > 3 else "?",
-        "paid_by":    row[4] if len(row) > 4 else "?",
-        "shared":     row[5] if len(row) > 5 else "?",
-        "per_person": row[6] if len(row) > 6 else "?",
+        "place":      row[1]  if len(row) > 1  else "?",
+        "item":       row[2]  if len(row) > 2  else "?",
+        "price":      row[3]  if len(row) > 3  else "?",
+        "paid_by":    row[4]  if len(row) > 4  else "?",
+        "shared":     row[5]  if len(row) > 5  else "?",
+        "per_person": row[6]  if len(row) > 6  else "?",
+        "category":   row[10] if len(row) > 10 else "",
     }
     for key, (label, _, _) in EDIT_FIELDS.items():
         current = field_values[key]
@@ -311,8 +359,13 @@ async def edit_pick_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hint = " (e.g. 25000 or 25k)" if needs_price else ""
     row     = context.chat_data.get("edit_row", [])
     field_values = {
-        "place": row[1], "item": row[2], "price": row[3],
-        "paid_by": row[4], "shared": row[5], "per_person": row[6],
+        "place":      row[1]  if len(row) > 1  else "?",
+        "item":       row[2]  if len(row) > 2  else "?",
+        "price":      row[3]  if len(row) > 3  else "?",
+        "paid_by":    row[4]  if len(row) > 4  else "?",
+        "shared":     row[5]  if len(row) > 5  else "?",
+        "per_person": row[6]  if len(row) > 6  else "?",
+        "category":   row[10] if len(row) > 10 else "",
     }
     current = field_values.get(field, "?") if len(row) > 6 else "?"
     await query.edit_message_text(
@@ -1056,22 +1109,47 @@ async def add_paid_by_button(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
     name  = query.data.split(":", 1)[1]
-    return await _finalize_add(update.effective_chat.id, name, context, query.message, edit=True)
+    context.chat_data["draft"]["paid_by"] = name
+    await query.edit_message_text(
+        f"Paid by: {name}\n\n🏷️ Pick a category:",
+        reply_markup=_category_keyboard("addcat"),
+    )
+    return ADD_CATEGORY
 
 
 async def add_paid_by_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await _finalize_add(update.effective_chat.id, update.message.text.strip(), context, update.message, edit=False)
+    context.chat_data["draft"]["paid_by"] = update.message.text.strip()
+    await update.message.reply_text("🏷️ Pick a category:", reply_markup=_category_keyboard("addcat"))
+    return ADD_CATEGORY
 
 
-async def _finalize_add(chat_id, payer_name, context, message_obj, edit=False):
+async def add_category_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    value = query.data.split(":", 1)[1]
+    if value == "__custom__":
+        await query.edit_message_text("✍️ Type your custom category:")
+        return ADD_CATEGORY
+    context.chat_data["draft"]["category"] = value
+    return await _show_add_confirm(update.effective_chat.id, context, query.message, edit=True)
+
+
+async def add_category_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.chat_data["draft"]["category"] = update.message.text.strip()
+    return await _show_add_confirm(update.effective_chat.id, context, update.message, edit=False)
+
+
+async def _show_add_confirm(chat_id, context, message_obj, edit=False):
     draft = context.chat_data["draft"]
-    draft["paid_by"]          = payer_name
-    draft["shared_by"]        = [payer_name]
-    draft["amount_per_person"] = draft["price"]
+    draft.setdefault("shared_by",        [draft["paid_by"]])
+    draft.setdefault("amount_per_person", draft["price"])
     summary = (
         f"📋 *Confirm entry*\n"
-        f"Place: {draft['place']}\nItem: {draft['item']}\n"
-        f"Price: {format_price(draft['price'])}\nPaid by: {draft['paid_by']}\n\n"
+        f"Place: {draft['place']}\n"
+        f"Item: {draft['item']}\n"
+        f"Price: {format_price(draft['price'])}\n"
+        f"Paid by: {draft['paid_by']}\n"
+        f"Category: {draft.get('category', '—')}\n\n"
         f"Sheet: {active_sheet_name(chat_id)}"
     )
     kb = [[InlineKeyboardButton("✅ Save", callback_data="add_save"),
@@ -1095,7 +1173,8 @@ async def add_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sheet_name = active_sheet_name(chat_id)
     sheets.append_expense(
         sheet_name, draft["place"], draft["item"], draft["price"],
-        draft["paid_by"], ", ".join(draft["shared_by"]), draft["amount_per_person"]
+        draft["paid_by"], ", ".join(draft["shared_by"]), draft["amount_per_person"],
+        category=draft.get("category", ""),
     )
     await query.edit_message_text(f"✅ Saved to *{sheet_name}*!", parse_mode="Markdown")
     return ConversationHandler.END
@@ -1129,8 +1208,30 @@ async def split_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def split_place(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data["split"]["place"] = update.message.text.strip()
+    await update.message.reply_text("🏷️ Pick a category for this bill:", reply_markup=_category_keyboard("spcat"))
+    return SPLIT_CATEGORY
+
+
+async def split_category_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    value = query.data.split(":", 1)[1]
+    if value == "__custom__":
+        await query.edit_message_text("✍️ Type your custom category:")
+        return SPLIT_CATEGORY
+    context.chat_data["split"]["category"] = value
+    await query.edit_message_text(f"Category: {value}\n\nWho paid the bill overall?")
+    return await _split_ask_payer(update, context)
+
+
+async def split_category_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.chat_data["split"]["category"] = update.message.text.strip()
+    await update.message.reply_text("Who paid the bill overall?")
+    return await _split_ask_payer(update, context)
+
+
+async def _split_ask_payer(update, context):
     members = state.get_members(update.effective_chat.id)
-    text = "Who paid the bill overall?"
     if members:
         kb = []
         row = []
@@ -1140,9 +1241,11 @@ async def split_place(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 kb.append(row); row = []
         if row: kb.append(row)
         kb.append([InlineKeyboardButton("✍️ Type manually...", callback_data="payer:__manual__")])
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
-    else:
-        await update.message.reply_text(text)
+        msg_text = "Who paid the bill overall?"
+        if hasattr(update, 'callback_query') and update.callback_query:
+            await update.callback_query.message.reply_text(msg_text, reply_markup=InlineKeyboardMarkup(kb))
+        else:
+            await update.message.reply_text(msg_text, reply_markup=InlineKeyboardMarkup(kb))
     return SPLIT_PAYER
 
 
@@ -1246,21 +1349,40 @@ async def split_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id    = update.effective_chat.id
     sheet_name = active_sheet_name(chat_id)
     payer      = split["payer"]
+    cat        = split.get("category", "")
     for it in split["items"]:
         share = it["price"] / len(it["names"])
-        sheets.append_expense(sheet_name, split["place"], it["item"], it["price"], payer, ", ".join(it["names"]), round(share, 2))
+        sheets.append_expense(sheet_name, split["place"], it["item"], it["price"], payer, ", ".join(it["names"]), round(share, 2), category=cat)
     if split.get("tax_pct"):
         tax_amount = sum(i["price"] for i in split["items"]) * split["tax_pct"] / 100
         all_names  = list(split["totals"].keys())
         sheets.append_expense(sheet_name, split["place"], f"Tax/Service ({split['tax_pct']}%)",
                               round(tax_amount, 2), payer, ", ".join(all_names),
-                              round(tax_amount / len(all_names), 2))
+                              round(tax_amount / len(all_names), 2), category=cat)
     await query.edit_message_text(f"✅ Saved {len(split['items'])} item(s) to *{sheet_name}*!", parse_mode="Markdown")
     return ConversationHandler.END
 
 
 async def even_place(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data["even"]["place"] = update.message.text.strip()
+    await update.message.reply_text("🏷️ Pick a category for this bill:", reply_markup=_category_keyboard("evcat"))
+    return EVEN_CATEGORY
+
+
+async def even_category_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    value = query.data.split(":", 1)[1]
+    if value == "__custom__":
+        await query.edit_message_text("✍️ Type your custom category:")
+        return EVEN_CATEGORY
+    context.chat_data["even"]["category"] = value
+    await query.edit_message_text(f"Category: {value}\n\nWho's splitting this? (comma-separated names)")
+    return EVEN_NAMES
+
+
+async def even_category_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.chat_data["even"]["category"] = update.message.text.strip()
     await update.message.reply_text("Who's splitting this? (comma-separated names)")
     return EVEN_NAMES
 
@@ -1344,7 +1466,8 @@ async def even_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id    = update.effective_chat.id
     sheet_name = active_sheet_name(chat_id)
     sheets.append_expense(sheet_name, even["place"], even["label"], even["total"],
-                          even["payer"], ", ".join(even["names"]), even["per_person"])
+                          even["payer"], ", ".join(even["names"]), even["per_person"],
+                          category=even.get("category", ""))
     await query.edit_message_text(f"✅ Saved to *{sheet_name}*!", parse_mode="Markdown")
     return ConversationHandler.END
 
@@ -1510,6 +1633,102 @@ async def stopreminder_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 # ---------------------------------------------------------------------------
+# /overview  — spending breakdown by category
+# ---------------------------------------------------------------------------
+
+async def overview_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    kb = [
+        [InlineKeyboardButton("📅 All Dates",  callback_data="ov_scope:all")],
+        [InlineKeyboardButton("🗓️ Single Day", callback_data="ov_scope:day")],
+        [InlineKeyboardButton("📆 Date Range", callback_data="ov_scope:range")],
+    ]
+    await update.message.reply_text(
+        "🏷️ *Spending by category*\nWhich timeframe?",
+        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb),
+    )
+    return OVERVIEW_SCOPE
+
+
+async def overview_scope(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    scope = query.data.split(":", 1)[1]
+    context.chat_data["ov_scope"] = scope
+    if scope == "all":
+        return await execute_overview(update.effective_chat.id, context, query.message, None, None, edit=True)
+    elif scope == "day":
+        await query.edit_message_text("Type the date (e.g. `20-06-2026`):", parse_mode="Markdown")
+    else:
+        await query.edit_message_text("Type start and end dates (e.g. `15-06-2026 to 20-06-2026`):", parse_mode="Markdown")
+    return OVERVIEW_DATE_INPUT
+
+
+async def overview_date_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text  = update.message.text.strip().lower().replace("to", " ").split()
+    scope = context.chat_data.get("ov_scope")
+    start_date_str = end_date_str = None
+    try:
+        from datetime import datetime as dt
+        if scope == "day":
+            if len(text) != 1:
+                await update.message.reply_text("Please provide exactly one date (e.g. `20-06-2026`).")
+                return OVERVIEW_DATE_INPUT
+            start_date_str = end_date_str = text[0]
+            dt.strptime(start_date_str, "%d-%m-%Y")
+        else:
+            if len(text) != 2:
+                await update.message.reply_text("Please provide two dates.")
+                return OVERVIEW_DATE_INPUT
+            start_date_str, end_date_str = text[0], text[1]
+            dt.strptime(start_date_str, "%d-%m-%Y")
+            dt.strptime(end_date_str,   "%d-%m-%Y")
+    except ValueError:
+        await update.message.reply_text("⚠️ Invalid date format. Use DD-MM-YYYY.")
+        return OVERVIEW_DATE_INPUT
+    return await execute_overview(update.effective_chat.id, context, update.message, start_date_str, end_date_str, edit=False)
+
+
+async def execute_overview(chat_id, context, message_obj, start_date_str, end_date_str, edit=False):
+    sheet_name = active_sheet_name(chat_id)
+    date_msg   = "all dates"
+    if start_date_str == end_date_str and start_date_str:
+        date_msg = start_date_str
+    elif start_date_str and end_date_str:
+        date_msg = f"{start_date_str} to {end_date_str}"
+
+    wait = f"⏳ Calculating overview for *{sheet_name}* ({date_msg})..."
+    if edit:
+        await message_obj.edit_text(wait, parse_mode="Markdown")
+    else:
+        await message_obj.reply_text(wait, parse_mode="Markdown")
+
+    try:
+        cats = sheets.get_category_overview(sheet_name, start_date_str, end_date_str)
+        if not cats:
+            text = f"No entries found in *{sheet_name}* for {date_msg}."
+        else:
+            grand_total = sum(v["total"] for v in cats.values())
+            lines = [f"🏷️ *Spending by category*\n_{sheet_name} — {date_msg}_\n"]
+            for i, (cat, data) in enumerate(cats.items(), 1):
+                pct = data["total"] / grand_total * 100 if grand_total else 0
+                bar = "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
+                lines.append(
+                    f"*{i}. {cat}*\n"
+                    f"   {bar} {pct:.1f}%\n"
+                    f"   {format_price(data['total'])}  ({data['count']} entr{'y' if data['count']==1 else 'ies'})"
+                )
+            lines.append(f"\n*Grand total: {format_price(grand_total)}*")
+            text = "\n".join(lines)
+        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Overview error: {e}")
+        await context.bot.send_message(chat_id=chat_id, text="⚠️ Could not calculate overview.")
+
+    context.chat_data.pop("ov_scope", None)
+    return ConversationHandler.END
+
+
+# ---------------------------------------------------------------------------
 # Error handler
 # ---------------------------------------------------------------------------
 
@@ -1597,6 +1816,10 @@ def main():
                 CallbackQueryHandler(add_paid_by_button, pattern=r"^paidby:"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_paid_by_text),
             ],
+            ADD_CATEGORY: [
+                CallbackQueryHandler(add_category_button, pattern=r"^addcat:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_category_text),
+            ],
             ADD_CONFIRM:  [CallbackQueryHandler(add_confirm, pattern=r"^add_(save|cancel)$")],
         },
         fallbacks=[CommandHandler("cancel", cancel_cmd)],
@@ -1624,6 +1847,16 @@ def main():
     )
     app.add_handler(totals_conv)
 
+    overview_conv = ConversationHandler(
+        entry_points=[CommandHandler("overview", restricted(overview_start))],
+        states={
+            OVERVIEW_SCOPE:      [CallbackQueryHandler(overview_scope, pattern=r"^ov_scope:")],
+            OVERVIEW_DATE_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, overview_date_input)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_cmd)],
+    )
+    app.add_handler(overview_conv)
+
     newevent_conv = ConversationHandler(
         entry_points=[CommandHandler("newevent", restricted(newevent_start))],
         states={NEWEVENT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, newevent_name)]},
@@ -1634,8 +1867,12 @@ def main():
     split_conv = ConversationHandler(
         entry_points=[CommandHandler("split", restricted(split_start))],
         states={
-            SPLIT_MODE:    [CallbackQueryHandler(split_mode, pattern=r"^split_mode:")],
-            SPLIT_PLACE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, split_place)],
+            SPLIT_MODE:     [CallbackQueryHandler(split_mode, pattern=r"^split_mode:")],
+            SPLIT_PLACE:    [MessageHandler(filters.TEXT & ~filters.COMMAND, split_place)],
+            SPLIT_CATEGORY: [
+                CallbackQueryHandler(split_category_btn,  pattern=r"^spcat:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, split_category_text),
+            ],
             SPLIT_PAYER:   [
                 CallbackQueryHandler(split_payer_btn, pattern=r"^payer:"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, split_payer),
@@ -1647,6 +1884,10 @@ def main():
             SPLIT_TAX:     [MessageHandler(filters.TEXT & ~filters.COMMAND, split_tax)],
             SPLIT_CONFIRM: [CallbackQueryHandler(split_confirm, pattern=r"^split(save|cancel)$")],
             EVEN_PLACE:    [MessageHandler(filters.TEXT & ~filters.COMMAND, even_place)],
+            EVEN_CATEGORY: [
+                CallbackQueryHandler(even_category_btn,  pattern=r"^evcat:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, even_category_text),
+            ],
             EVEN_PAYER:    [
                 CallbackQueryHandler(even_payer_btn, pattern=r"^evenpayer:"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, even_payer),
