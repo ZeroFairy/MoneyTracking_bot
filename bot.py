@@ -1310,7 +1310,9 @@ async def split_tax(update: Update, context: ContextTypes.DEFAULT_TYPE):
     split = context.chat_data["split"]
     split["tax_pct"] = tax_pct
     items = split["items"]
-    totals = {}
+
+    # Calculate each person's pre-tax subtotal
+    subtotals = {}
     lines  = ["🧾 *Itemized Bill Summary*"]
     for it in items:
         share = it["price"] / len(it["names"])
@@ -1319,19 +1321,29 @@ async def split_tax(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"({', '.join(it['names'])}) = {format_price(share)}/person"
         )
         for n in it["names"]:
-            totals[n] = totals.get(n, 0) + share
+            subtotals[n] = subtotals.get(n, 0) + share
+
     subtotal = sum(it["price"] for it in items)
     lines.append(f"\nSubtotal: {format_price(subtotal)}")
+
+    # Apply tax proportionally based on each person's share of the subtotal
+    totals = dict(subtotals)
     if tax_pct:
-        lines.append(f"Tax/Service: {tax_pct}%")
+        total_tax = subtotal * tax_pct / 100
+        lines.append(f"Tax/Service ({tax_pct}%): {format_price(total_tax)}")
+        lines.append("_(tax split proportionally by order size)_")
         for n in totals:
-            totals[n] *= 1 + tax_pct / 100
+            person_tax = (subtotals[n] / subtotal) * total_tax if subtotal else 0
+            totals[n] = subtotals[n] + person_tax
+
     lines.append(f"\n💰 *Paid by:* {split['payer']}")
-    lines.append("*Final amounts owed:*")
+    lines.append("*Final amounts owed (tax included):*")
     for n, amt in totals.items():
         note = " (payer)" if n.lower() == split["payer"].lower() else ""
         lines.append(f"  {n}: {format_price(amt)}{note}")
-    split["totals"] = totals
+
+    split["totals"]   = totals
+    split["subtotals"] = subtotals
     kb = [[InlineKeyboardButton("✅ Save to Sheet", callback_data="splitsave"),
            InlineKeyboardButton("❌ Cancel",        callback_data="splitcancel")]]
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
@@ -1350,16 +1362,25 @@ async def split_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sheet_name = active_sheet_name(chat_id)
     payer      = split["payer"]
     cat        = split.get("category", "")
+    tax_pct    = split.get("tax_pct", 0)
+    tax_mult   = 1 + tax_pct / 100  # e.g. 1.10 for 10% tax
+
     for it in split["items"]:
-        share = it["price"] / len(it["names"])
-        sheets.append_expense(sheet_name, split["place"], it["item"], it["price"], payer, ", ".join(it["names"]), round(share, 2), category=cat)
-    if split.get("tax_pct"):
-        tax_amount = sum(i["price"] for i in split["items"]) * split["tax_pct"] / 100
-        all_names  = list(split["totals"].keys())
-        sheets.append_expense(sheet_name, split["place"], f"Tax/Service ({split['tax_pct']}%)",
-                              round(tax_amount, 2), payer, ", ".join(all_names),
-                              round(tax_amount / len(all_names), 2), category=cat)
-    await query.edit_message_text(f"✅ Saved {len(split['items'])} item(s) to *{sheet_name}*!", parse_mode="Markdown")
+        # Bake proportional tax into each item's price
+        taxed_price = round(it["price"] * tax_mult)
+        share       = it["price"] / len(it["names"])
+        taxed_share = round(share * tax_mult)
+        label = it["item"] + (f" (incl. {tax_pct}% tax)" if tax_pct else "")
+        sheets.append_expense(
+            sheet_name, split["place"], label,
+            taxed_price, payer, ", ".join(it["names"]),
+            taxed_share, category=cat,
+        )
+    await query.edit_message_text(
+        f"✅ Saved {len(split['items'])} item(s) to *{sheet_name}*!"
+        + (f"\n_(prices include {tax_pct}% tax, split proportionally)_" if tax_pct else ""),
+        parse_mode="Markdown",
+    )
     return ConversationHandler.END
 
 
@@ -1708,7 +1729,11 @@ async def execute_overview(chat_id, context, message_obj, start_date_str, end_da
             text = f"No entries found in *{sheet_name}* for {date_msg}."
         else:
             grand_total = sum(v["total"] for v in cats.values())
-            lines = [f"🏷️ *Spending by category*\n_{sheet_name} — {date_msg}_\n"]
+            lines = [
+                f"🏷️ *Spending by category*\n"
+                f"_{sheet_name} — {date_msg}_\n"
+                f"_(shows full bill amount per category, not per-person)_\n"
+            ]
             for i, (cat, data) in enumerate(cats.items(), 1):
                 pct = data["total"] / grand_total * 100 if grand_total else 0
                 bar = "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
