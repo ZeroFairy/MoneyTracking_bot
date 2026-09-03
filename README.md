@@ -9,14 +9,14 @@ sheet every month.
 
 | Command | What it does |
 |---|---|
-| `/add` | Log an expense step-by-step (place, item, price, paid by, category) |
-| `/q` | Quick-add a solo expense in one line, e.g. `/q Indomaret Aqua 5000` |
+| `/add` | Log an expense step-by-step (place, item, price, paid by, category, date) |
+| `/q` | Quick-add a solo expense in one line, always marked paid, e.g. `/q Indomaret Aqua 5000` |
 | `/split` | Split a group bill — itemized (everyone ordered different things) or split evenly |
-| `/edit` | Edit a field on an existing entry (place, item, price, paid by, shared, amount/person, category) |
+| `/edit` | Edit a field on an existing entry (date, place, item, price, paid by, shared, amount/person, category) |
 | `/summary` | Calculate who owes whom — Smart (optimized) or Normal (straight), filterable by date |
 | `/totals` | Total spending per person, filterable by date |
 | `/overview` | Spending breakdown by category, filterable by date |
-| `/list` | Browse all entries in the active sheet, paginated |
+| `/list` | Browse all entries in the active sheet, paginated, numbered #1, #2, ... |
 | `/delete` | Delete an entry (tap from a paginated list) |
 | `/markpaid` | Mark an entry (or individual people on a split entry) as paid/unpaid |
 | `/getlink` (alias `/sheet`) | Get the spreadsheet link |
@@ -207,8 +207,9 @@ sudo systemctl restart expensebot    # after editing bot.py or requirements.txt
 ## 9. Usage tips
 
 - **Prices**: you can type `25000`, `25.000`, `25,000`, or `25k` — all parsed the same way.
-- **Personal vs Group Expenses**: Use `/add` or `/q` for simple, personal logging. Use `/split`
-  for any shared bills.
+- **Personal vs Group Expenses**: Use `/add` or `/q` for simple, personal logging — `/q` always
+  saves as ✅ Paid, since it's meant for things only you paid for. Use `/split` for any shared
+  bills.
 - **Quick-Select Buttons**: Type `/setmembers Name1, Name2, Name3` in any chat or group. The bot
   will remember those members and generate clickable buttons whenever it asks who paid for an
   expense!
@@ -222,6 +223,15 @@ sudo systemctl restart expensebot    # after editing bot.py or requirements.txt
 - **Splitting one shared total evenly**: use `/split` → "Split Evenly".
 - **Tracking payments**: use `/markpaid` to mark a whole entry paid/unpaid, or — for split
   entries — toggle which individual people have settled up.
+- **Backdating an expense**: `/add` asks "When was this?" with Today / Yesterday / type-a-date
+  buttons. `/q` accepts an `@date` tag at the very end, e.g. `/q Indomaret Aqua 5000 @yesterday`
+  or `/q Cafe Kopi 20000 #food @25-06-2026`.
+- **Fixing the date on an existing entry**: `/edit` → pick the entry → **📅 Date**. Accepts a date
+  alone (`25-06-2026`, keeps the current time) or a date with a specific time
+  (`25-06-2026 14:30`), plus `today` / `yesterday` (optionally with a time too, e.g.
+  `yesterday 20:15`).
+- **Entry numbers**: `/list`, `/edit`, `/delete`, and `/markpaid` all number entries starting from
+  `#1` for your first-ever entry in that sheet, in the order they were added.
 - **Daily reminders**: `/setreminder 20:00 Log your expenses!` sets a daily nudge at 20:00 WIB.
   Add as many as you like; manage them with `/listreminders` and `/stopreminder`.
 - **Trips/events**: `/newevent` makes a new tab and switches you to it. Use `/switch` any time to
@@ -234,6 +244,9 @@ sudo systemctl restart expensebot    # after editing bot.py or requirements.txt
 ---
 
 ## Notes
+- All timestamps (dates on new entries, reminder times) are calculated in **WIB (UTC+7)**
+  regardless of what timezone the server itself is set to — most cloud VMs default to UTC, so
+  this conversion happens in code rather than relying on the server's clock/timezone settings.
 - All data lives in your own Google Sheet — you can open, edit, or chart it manually any time.
 - `state.json` (created automatically next to `bot.py`) remembers which tab each chat is
   currently using, custom group members, and saved reminders — safe to delete if you want to
