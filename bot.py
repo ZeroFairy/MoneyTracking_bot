@@ -17,7 +17,7 @@ from telegram.ext import (
 import config
 import sheets
 import state
-from utils import format_price, parse_price
+from utils import format_price, parse_price, parse_date_input
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -35,6 +35,7 @@ ADD_CATEGORY   = 26
 SPLIT_CATEGORY = 27
 EVEN_CATEGORY  = 28
 OVERVIEW_SCOPE, OVERVIEW_DATE_INPUT = range(29, 31)
+ADD_DATE = 31
 
 LIST_PAGE_SIZE    = 5
 MARKPAID_PAGE_SIZE = 8
@@ -140,16 +141,21 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 QUICKADD_USAGE = (
     "⚡ *Quick Add usage:*\n"
     "`/q Place Item Price`\n"
-    "`/q Place Item Price #category`\n\n"
+    "`/q Place Item Price #category`\n"
+    "`/q Place Item Price #category @date`\n\n"
     "*Examples:*\n"
     "`/q Indomaret Aqua 5000`\n"
     "`/q Alfamart Indomie 3500 #food`\n"
     "`/q Grab Motor 15000 #transport`\n"
-    "`/q Parkir Motor 2k`\n\n"
+    "`/q Parkir Motor 2k`\n"
+    "`/q Indomaret Aqua 5000 @yesterday`\n"
+    "`/q Cafe Kopi 20000 #food @25-06-2026`\n\n"
     "• First word = place\n"
-    "• Last word = price (or #tag, then price before it)\n"
+    "• Last word = price (or #tag / @date, then price before it)\n"
     "• Everything in between = item name\n"
     "• Add `#tag` at the end to set a category (optional)\n"
+    "• Add `@date` at the end for a backdated entry — `@today`, `@yesterday`, "
+    "or `@DD-MM-YYYY` (optional, defaults to right now)\n"
     "• You are set as payer and sole sharer\n"
     "• Use /add instead if others are sharing the cost"
 )
@@ -171,7 +177,28 @@ async def quickadd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Check if last arg is a #category tag
+    # Check if last arg is an @date tag
+    date_str = None
+    if args[-1].startswith("@"):
+        date_raw = args[-1][1:].strip()
+        try:
+            date_str = parse_date_input(date_raw)
+        except ValueError:
+            await update.message.reply_text(
+                f"⚠️ Couldn't read `{date_raw}` as a date.\n"
+                "Try `today`, `yesterday`, or `25-06-2026`.",
+                parse_mode="Markdown",
+            )
+            return
+        args = args[:-1]
+        if len(args) < 3:
+            await update.message.reply_text(
+                "⚠️ Need at least 3 parts before the @tag: *Place*, *Item*, *Price*\n\n" + QUICKADD_USAGE,
+                parse_mode="Markdown",
+            )
+            return
+
+    # Check if last remaining arg is a #category tag
     category = ""
     if args[-1].startswith("#"):
         category = args[-1][1:].replace("_", " ").strip()
@@ -200,13 +227,14 @@ async def quickadd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sender     = update.effective_user.first_name
     chat_id    = update.effective_chat.id
     sheet_name = active_sheet_name(chat_id)
-    sheets.append_expense(sheet_name, place, item, price, sender, sender, price, category=category)
-    cat_line = f"  🏷️ {category}" if category else ""
+    sheets.append_expense(sheet_name, place, item, price, sender, sender, price, category=category, date_str=date_str)
+    cat_line  = f"  🏷️ {category}" if category else ""
+    date_line = f"\n📅 {date_str.split(' ')[0]}" if date_str else ""
     await update.message.reply_text(
         f"⚡ *Saved!*\n"
         f"📍 {place} — {item}\n"
         f"💰 {format_price(price)}  |  🙋 {sender}{cat_line}\n"
-        f"📋 Sheet: {sheet_name}",
+        f"📋 Sheet: {sheet_name}{date_line}",
         parse_mode="Markdown",
     )
 
@@ -234,6 +262,7 @@ EDIT_PAGE_SIZE = 8
 
 # Maps field key → (display label, column number, needs price parsing)
 EDIT_FIELDS = {
+    "date":       ("📅 Date",           1, False),
     "place":      ("📍 Place",          2, False),
     "item":       ("📝 Item",           3, False),
     "price":      ("💰 Price",          4, True),
@@ -270,6 +299,7 @@ def _edit_field_keyboard(row_num, row):
     """Show the current values and let user pick which field to edit."""
     kb = []
     field_values = {
+        "date":       row[0]  if len(row) > 0  else "?",
         "place":      row[1]  if len(row) > 1  else "?",
         "item":       row[2]  if len(row) > 2  else "?",
         "price":      row[3]  if len(row) > 3  else "?",
@@ -356,9 +386,15 @@ async def edit_pick_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     field   = parts[2]
     label, _, needs_price = EDIT_FIELDS[field]
     context.chat_data["edit_field"] = field
-    hint = " (e.g. 25000 or 25k)" if needs_price else ""
+    if needs_price:
+        hint = " (e.g. 25000 or 25k)"
+    elif field == "date":
+        hint = " (e.g. 25-06-2026, or `today` / `yesterday`)"
+    else:
+        hint = ""
     row     = context.chat_data.get("edit_row", [])
     field_values = {
+        "date":       row[0]  if len(row) > 0  else "?",
         "place":      row[1]  if len(row) > 1  else "?",
         "item":       row[2]  if len(row) > 2  else "?",
         "price":      row[3]  if len(row) > 3  else "?",
@@ -392,6 +428,14 @@ async def edit_save_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await update.message.reply_text(
                 f"⚠️ Couldn't read that as a price. Try `25000`, `25.000`, or `25k`."
+            )
+            return EDIT_VALUE
+    elif field == "date":
+        try:
+            save_value = parse_date_input(raw_value)
+        except ValueError:
+            await update.message.reply_text(
+                "⚠️ Couldn't read that as a date. Try `25-06-2026`, `today`, or `yesterday`."
             )
             return EDIT_VALUE
     else:
@@ -1131,11 +1175,49 @@ async def add_category_button(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_text("✍️ Type your custom category:")
         return ADD_CATEGORY
     context.chat_data["draft"]["category"] = value
-    return await _show_add_confirm(update.effective_chat.id, context, query.message, edit=True)
+    return await _ask_add_date(update.effective_chat.id, context, query.message, edit=True)
 
 
 async def add_category_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data["draft"]["category"] = update.message.text.strip()
+    return await _ask_add_date(update.effective_chat.id, context, update.message, edit=False)
+
+
+async def _ask_add_date(chat_id, context, message_obj, edit=False):
+    kb = [
+        [InlineKeyboardButton("📅 Today", callback_data="adddate:today"),
+         InlineKeyboardButton("📅 Yesterday", callback_data="adddate:yesterday")],
+        [InlineKeyboardButton("✍️ Type a date...", callback_data="adddate:__custom__")],
+    ]
+    text = "📅 When was this?"
+    if edit:
+        await message_obj.edit_text(text, reply_markup=InlineKeyboardMarkup(kb))
+    else:
+        await message_obj.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
+    return ADD_DATE
+
+
+async def add_date_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    value = query.data.split(":", 1)[1]
+    if value == "__custom__":
+        await query.edit_message_text("✍️ Type the date (e.g. `25-06-2026`):", parse_mode="Markdown")
+        return ADD_DATE
+    context.chat_data["draft"]["date_str"] = parse_date_input(value)
+    return await _show_add_confirm(update.effective_chat.id, context, query.message, edit=True)
+
+
+async def add_date_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.strip()
+    try:
+        context.chat_data["draft"]["date_str"] = parse_date_input(raw)
+    except ValueError:
+        await update.message.reply_text(
+            "⚠️ Couldn't read that date. Try `25-06-2026`, `today`, or `yesterday`.",
+            parse_mode="Markdown",
+        )
+        return ADD_DATE
     return await _show_add_confirm(update.effective_chat.id, context, update.message, edit=False)
 
 
@@ -1143,13 +1225,15 @@ async def _show_add_confirm(chat_id, context, message_obj, edit=False):
     draft = context.chat_data["draft"]
     draft.setdefault("shared_by",        [draft["paid_by"]])
     draft.setdefault("amount_per_person", draft["price"])
+    date_display = draft["date_str"].split(" ")[0] if draft.get("date_str") else "Today (now)"
     summary = (
         f"📋 *Confirm entry*\n"
         f"Place: {draft['place']}\n"
         f"Item: {draft['item']}\n"
         f"Price: {format_price(draft['price'])}\n"
         f"Paid by: {draft['paid_by']}\n"
-        f"Category: {draft.get('category', '—')}\n\n"
+        f"Category: {draft.get('category', '—')}\n"
+        f"Date: {date_display}\n\n"
         f"Sheet: {active_sheet_name(chat_id)}"
     )
     kb = [[InlineKeyboardButton("✅ Save", callback_data="add_save"),
@@ -1174,7 +1258,7 @@ async def add_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sheets.append_expense(
         sheet_name, draft["place"], draft["item"], draft["price"],
         draft["paid_by"], ", ".join(draft["shared_by"]), draft["amount_per_person"],
-        category=draft.get("category", ""),
+        category=draft.get("category", ""), date_str=draft.get("date_str"),
     )
     await query.edit_message_text(f"✅ Saved to *{sheet_name}*!", parse_mode="Markdown")
     return ConversationHandler.END
@@ -1844,6 +1928,10 @@ def main():
             ADD_CATEGORY: [
                 CallbackQueryHandler(add_category_button, pattern=r"^addcat:"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_category_text),
+            ],
+            ADD_DATE: [
+                CallbackQueryHandler(add_date_button, pattern=r"^adddate:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_date_text),
             ],
             ADD_CONFIRM:  [CallbackQueryHandler(add_confirm, pattern=r"^add_(save|cancel)$")],
         },

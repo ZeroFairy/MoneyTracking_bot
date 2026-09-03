@@ -26,4 +26,27 @@ def format_price(value) -> str:
     if value is None:
         return "-"
     return "Rp" + format(round(float(value)), ",").replace(",", ".")
-    
+
+
+def parse_date_input(raw: str) -> str:
+    """Parse a user-supplied date into a 'DD-MM-YYYY HH:MM' timestamp string.
+
+    Accepts: "today", "now", "yesterday", or an explicit "DD-MM-YYYY" date.
+    The current time-of-day is always used (only the date itself is customizable).
+    """
+    from datetime import datetime, timedelta
+
+    s = raw.strip().lower()
+    now = datetime.now()
+
+    if s in ("today", "now"):
+        date_part = now.date()
+    elif s == "yesterday":
+        date_part = (now - timedelta(days=1)).date()
+    else:
+        try:
+            date_part = datetime.strptime(raw.strip(), "%d-%m-%Y").date()
+        except ValueError:
+            raise ValueError(f"Could not parse date from: {raw!r}")
+
+    return f"{date_part.strftime('%d-%m-%Y')} {now.strftime('%H:%M')}"

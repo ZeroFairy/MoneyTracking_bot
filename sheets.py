@@ -53,9 +53,9 @@ def list_sheet_titles():
     return [ws.title for ws in _spreadsheet().worksheets()]
 
 
-def append_expense(sheet_name, place, item, price, paid_by, shared_by, amount_per_person, picture="-", status="⏳ Unpaid", category=""):
+def append_expense(sheet_name, place, item, price, paid_by, shared_by, amount_per_person, picture="-", status="⏳ Unpaid", category="", date_str=None):
     ws = get_or_create_worksheet(sheet_name)
-    ts = datetime.now().strftime("%d-%m-%Y %H:%M")
+    ts = date_str if date_str else datetime.now().strftime("%d-%m-%Y %H:%M")
     from utils import format_price
     ws.append_row(
         [ts, place, item, format_price(price), paid_by, shared_by,
@@ -119,6 +119,7 @@ def set_settled_by(sheet_name: str, row_num: int, names: list):
 
 # Column numbers for editable fields (1-indexed)
 FIELD_COLS = {
+    "date":       1,
     "place":      2,
     "item":       3,
     "price":      4,
