@@ -1610,6 +1610,9 @@ def _job_name(chat_id: int, reminder_id: str) -> str:
 
 def _schedule_one(app, chat_id: int, reminder: dict):
     """Schedule a single reminder dict. Replaces existing job with same ID."""
+    if app.job_queue is None:
+        logger.warning("JobQueue not available — reminder saved but won't fire.")
+        return
     jname = _job_name(chat_id, reminder["id"])
     for job in app.job_queue.get_jobs_by_name(jname):
         job.schedule_removal()
@@ -1671,6 +1674,16 @@ async def setreminder_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
 
+    if context.application.job_queue is None:
+        await update.message.reply_text(
+            "⚠️ Reminder saved but won't fire until the job scheduler is installed.\n\n"
+            "SSH into the VM and run:\n"
+            "`source ~/expense_bot/venv/bin/activate`\n"
+            "`pip install 'python-telegram-bot[job-queue]==21.4'`\n"
+            "Then restart the bot.",
+            parse_mode="Markdown",
+        )
+
 
 async def listreminders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id   = update.effective_chat.id
@@ -1722,10 +1735,11 @@ async def stopreminder_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     if rid == "__all__":
         reminders = state.get_reminders(chat_id)
-        for r in reminders:
-            jname = _job_name(chat_id, r["id"])
-            for job in context.application.job_queue.get_jobs_by_name(jname):
-                job.schedule_removal()
+        if context.application.job_queue is not None:
+            for r in reminders:
+                jname = _job_name(chat_id, r["id"])
+                for job in context.application.job_queue.get_jobs_by_name(jname):
+                    job.schedule_removal()
         state.delete_all_reminders(chat_id)
         await query.edit_message_text("🗑️ All reminders removed.")
         return
@@ -1734,9 +1748,10 @@ async def stopreminder_callback(update: Update, context: ContextTypes.DEFAULT_TY
     reminders = state.get_reminders(chat_id)
     target    = next((r for r in reminders if r["id"] == rid), None)
     if target:
-        jname = _job_name(chat_id, rid)
-        for job in context.application.job_queue.get_jobs_by_name(jname):
-            job.schedule_removal()
+        if context.application.job_queue is not None:
+            jname = _job_name(chat_id, rid)
+            for job in context.application.job_queue.get_jobs_by_name(jname):
+                job.schedule_removal()
         state.delete_reminder(chat_id, rid)
         hour_wib = (target["hour"] + WIB_OFFSET) % 24
         await query.edit_message_text(
