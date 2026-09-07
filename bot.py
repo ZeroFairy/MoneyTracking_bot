@@ -83,6 +83,7 @@ HELP_TEXT = (
     "/delete — delete an entry\n"
     "/markpaid — mark entries paid/unpaid or per-person\n"
     "/getlink — get the spreadsheet link\n"
+    "/sortsheet — re-sort the active sheet by date & time\n"
     "/newevent — create a new sheet for a trip/event\n"
     "/switch — switch between sheets\n"
     "/setmembers — save group names for quick-select\n"
@@ -135,6 +136,34 @@ async def getlink_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{tab_url}\n\n"
         f"Full spreadsheet:\n"
         f"{sheet_url}"
+    )
+
+
+async def sortsheet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Re-sorts the active sheet's rows chronologically by Date & Time.
+
+    Fixes ordering when backdated entries (via /add, /q @date, or /edit) end
+    up out of sequence, since new rows are always appended to the bottom
+    regardless of their date.
+    """
+    chat_id = update.effective_chat.id
+    name    = active_sheet_name(chat_id)
+    await update.message.reply_text(f"🔄 Sorting *{name}* by date & time…", parse_mode="Markdown")
+    try:
+        count = sheets.sort_by_date(name)
+    except Exception:
+        logger.exception("sortsheet failed")
+        await update.message.reply_text("❌ Something went wrong while sorting. Please try again.")
+        return
+    if count == 0:
+        await update.message.reply_text("Nothing to sort — the sheet is empty.")
+        return
+    await update.message.reply_text(
+        f"✅ Sorted *{count}* {'entry' if count == 1 else 'entries'} in *{name}* "
+        f"chronologically (oldest → newest).\n\n"
+        f"⚠️ Row numbers may have shifted — re-check /list, /edit, /delete or /markpaid "
+        f"before using an entry number you noted earlier.",
+        parse_mode="Markdown",
     )
 
 
@@ -1593,15 +1622,28 @@ async def even_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 import random
 import datetime
+import html
 
 WIB_OFFSET = 7  # WIB = UTC+7
+
+# Rotates so daily reminders don't feel like the exact same robotic ping every time.
+_REMINDER_HEADERS = [
+    ("⏰", "Reminder"),
+    ("📝", "Don't forget"),
+    ("💸", "Expense check-in"),
+    ("🔔", "Friendly nudge"),
+]
 
 
 async def _send_reminder(context):
     """Job callback — sends the custom message saved with this reminder."""
-    message = context.job.data.get("message", "⏰ Reminder!")
+    message = (context.job.data.get("message") or "").strip() or "Log your expenses!"
     chat_id = context.job.chat_id
-    await context.bot.send_message(chat_id=chat_id, text=message)
+    emoji, header = random.choice(_REMINDER_HEADERS)
+    # Escape the user's own text so it can't break HTML parsing, then wrap it
+    # with a bold header — much easier to read at a glance than plain text.
+    text = f"{emoji} <b>{header}</b>\n\n{html.escape(message)}"
+    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
 
 
 def _job_name(chat_id: int, reminder_id: str) -> str:
@@ -1895,6 +1937,8 @@ def main():
     app.add_handler(CommandHandler("help",       restricted(start_cmd)))
     app.add_handler(CommandHandler("getlink",    restricted(getlink_cmd)))
     app.add_handler(CommandHandler("sheet",      restricted(getlink_cmd)))  # keep old name as alias
+    app.add_handler(CommandHandler("sortsheet",  restricted(sortsheet_cmd)))
+    app.add_handler(CommandHandler("sort",       restricted(sortsheet_cmd)))  # short alias
     app.add_handler(CommandHandler("list",       restricted(list_cmd)))
     app.add_handler(CallbackQueryHandler(list_page_callback, pattern=r"^listpage:"))
     app.add_handler(CommandHandler("delete",     restricted(delete_cmd)))
