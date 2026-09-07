@@ -140,6 +140,49 @@ def update_expense_field(sheet_name: str, row_num: int, field: str, value: str):
     ws.update_cell(row_num, col, value)
 
 
+def sort_by_date(sheet_name: str) -> int:
+    """Re-sorts all data rows in the sheet chronologically (oldest first) by
+    the Date & Time column (A).
+
+    New entries are always appended to the bottom regardless of their date
+    (e.g. backdated /add or /q @date entries), so this is what fixes the
+    on-sheet order without touching entry content. Malformed/unparseable
+    dates are pushed to the end, keeping their original relative order.
+
+    Returns the number of data rows sorted (0 if the sheet is empty).
+    """
+    ws = get_or_create_worksheet(sheet_name)
+    all_vals = ws.get_all_values()
+    if len(all_vals) <= 1:
+        return 0
+
+    data_rows = [row for row in all_vals[1:] if any(row)]
+    if not data_rows:
+        return 0
+
+    width = len(HEADERS)
+
+    def _pad(row):
+        row = list(row[:width])
+        row += [""] * (width - len(row))
+        return row
+
+    data_rows = [_pad(row) for row in data_rows]
+
+    def _sort_key(row):
+        try:
+            return (0, datetime.strptime(row[0].strip(), "%d-%m-%Y %H:%M"))
+        except (ValueError, IndexError):
+            return (1, datetime.max)  # unparseable dates sink to the bottom
+
+    data_rows.sort(key=_sort_key)  # stable: ties/malformed keep original order
+
+    last_col = chr(ord("A") + width - 1)
+    end_row = 1 + len(data_rows)
+    ws.update(f"A2:{last_col}{end_row}", data_rows, value_input_option="USER_ENTERED")
+    return len(data_rows)
+
+
 def sheet_url(sheet_name):
     ws  = get_or_create_worksheet(sheet_name)
     sid = _spreadsheet().id
