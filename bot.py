@@ -3,7 +3,7 @@ import logging
 import asyncio
 from functools import wraps
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -1994,10 +1994,31 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # Main
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Telegram's "☰ Menu" button — a short, curated list of the most-used
+# commands (not every command — the full list stays in /help).
+# ---------------------------------------------------------------------------
+
+BOT_MENU_COMMANDS = [
+    BotCommand("add",     "Log an expense step by step"),
+    BotCommand("q",       "Quick-add a solo expense"),
+    BotCommand("split",   "Split a group bill"),
+    BotCommand("summary", "See who owes whom"),
+    BotCommand("list",    "Browse recent entries"),
+    BotCommand("undo",    "Remove the last entry"),
+    BotCommand("switch",  "Switch active sheet"),
+    BotCommand("help",    "Show all commands"),
+]
+
+
+async def _post_init(app):
+    await app.bot.set_my_commands(BOT_MENU_COMMANDS)
+
+
 def main():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    app = ApplicationBuilder().token(config.TELEGRAM_BOT_TOKEN).build()
+    app = ApplicationBuilder().token(config.TELEGRAM_BOT_TOKEN).post_init(_post_init).build()
 
     # Restore saved reminders from state.json on startup
     for chat_id, reminders in state.get_all_reminders().items():
