@@ -81,6 +81,7 @@ HELP_TEXT = (
     "/overview — spending breakdown by category\n"
     "/list — browse all entries\n"
     "/delete — delete an entry\n"
+    "/undo — quickly delete the most recent entry\n"
     "/markpaid — mark entries paid/unpaid or per-person\n"
     "/getlink — get the spreadsheet link\n"
     "/sortsheet — re-sort the active sheet by date & time\n"
@@ -688,6 +689,62 @@ async def delete_cancel_callback(update: Update, context: ContextTypes.DEFAULT_T
     await query.answer()
     context.chat_data.pop("del_rows",  None)
     context.chat_data.pop("del_sheet", None)
+    await query.edit_message_text("Cancelled.")
+
+
+# ---------------------------------------------------------------------------
+# /undo — quick-remove the single most recently added entry, no pagination
+# ---------------------------------------------------------------------------
+
+async def undo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id  = update.effective_chat.id
+    name     = active_sheet_name(chat_id)
+    all_rows = sheets.get_all_expenses(name)  # newest (last appended) first
+    if not all_rows:
+        await update.message.reply_text(f"Nothing to undo — *{name}* is empty.", parse_mode="Markdown")
+        return
+
+    row_num, row = all_rows[0]
+    date  = row[0] if len(row) > 0 else "?"
+    place = row[1] if len(row) > 1 else "?"
+    item  = row[2] if len(row) > 2 else "?"
+    price = row[3] if len(row) > 3 else "?"
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🗑️ Yes, undo it", callback_data=f"undo:{name}:{row_num}"),
+        InlineKeyboardButton("Cancel", callback_data="undocancel"),
+    ]])
+    await update.message.reply_text(
+        f"↩️ *Undo the last entry?*\n\n"
+        f"📅 {date}\n📍 {place} — {item}\n💰 {price}\n\n"
+        f"This removes it from *{name}*.",
+        parse_mode="Markdown", reply_markup=keyboard,
+    )
+
+
+async def undo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, name, row_num = query.data.split(":")
+    row_num = int(row_num)
+
+    # Re-check it's still the most recent row before deleting — something else
+    # may have been added or removed since the confirmation prompt was sent.
+    all_rows = sheets.get_all_expenses(name)
+    if not all_rows or all_rows[0][0] != row_num:
+        await query.edit_message_text(
+            "⚠️ The sheet changed since this prompt — nothing was deleted.\n"
+            "Use /list or /delete to remove a specific entry instead."
+        )
+        return
+
+    sheets.delete_row(name, row_num)
+    await query.edit_message_text(f"↩️ Undone — removed the last entry from *{name}*.", parse_mode="Markdown")
+
+
+async def undo_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
     await query.edit_message_text("Cancelled.")
 
 
@@ -1961,9 +2018,12 @@ def main():
     app.add_handler(CommandHandler("list",       restricted(list_cmd)))
     app.add_handler(CallbackQueryHandler(list_page_callback, pattern=r"^listpage:"))
     app.add_handler(CommandHandler("delete",     restricted(delete_cmd)))
+    app.add_handler(CommandHandler("undo",       restricted(undo_cmd)))
     app.add_handler(CallbackQueryHandler(delete_page_callback,   pattern=r"^delpage:"))
     app.add_handler(CallbackQueryHandler(delete_callback,        pattern=r"^del:"))
     app.add_handler(CallbackQueryHandler(delete_cancel_callback, pattern=r"^delcancel$"))
+    app.add_handler(CallbackQueryHandler(undo_callback,          pattern=r"^undo:"))
+    app.add_handler(CallbackQueryHandler(undo_cancel_callback,   pattern=r"^undocancel$"))
     app.add_handler(CommandHandler("q",          restricted(quickadd_cmd)))
     app.add_handler(CommandHandler("quickadd",   restricted(quickadd_cmd)))
     app.add_handler(CommandHandler("markpaid",   restricted(markpaid_cmd)))
