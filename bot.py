@@ -177,20 +177,22 @@ QUICKADD_USAGE = (
     "⚡ *Quick Add usage:*\n"
     "`/q Place Item Price`\n"
     "`/q Place Item Price #category`\n"
-    "`/q Place Item Price #category @date`\n\n"
+    "`/q Place Item Price #category @date`\n"
+    "`/q Place ; Item ; Price` _(for multi-word place names)_\n\n"
     "*Examples:*\n"
     "`/q Indomaret Aqua 5000`\n"
     "`/q Alfamart Indomie 3500 #food`\n"
     "`/q Grab Motor 15000 #transport`\n"
     "`/q Parkir Motor 2k`\n"
     "`/q Indomaret Aqua 5000 @yesterday`\n"
-    "`/q Cafe Kopi 20000 #food @25-06-2026`\n\n"
-    "• First word = place\n"
-    "• Last word = price (or #tag / @date, then price before it)\n"
-    "• Everything in between = item name\n"
+    "`/q Cafe Kopi 20000 #food @25-06-2026`\n"
+    "`/q Cafe Kopi 20000 @14:30` _(today, at 14:30)_\n"
+    "`/q Warung Nasi Padang ; Ayam Bakar Sambal ; 25000` _(multi-word place & item)_\n\n"
+    "• First word = place, last word = price, everything in between = item\n"
+    "• Place or item has more than one word? Use `Place ; Item ; Price` instead\n"
     "• Add `#tag` at the end to set a category (optional)\n"
     "• Add `@date` at the end for a backdated entry — `@today`, `@yesterday`, "
-    "or `@DD-MM-YYYY` (optional, defaults to right now)\n"
+    "`@DD-MM-YYYY`, or just `@HH:MM` for today at that time (optional, defaults to right now)\n"
     "• You are set as payer and sole sharer\n"
     "• Use /add instead if others are sharing the cost"
 )
@@ -204,50 +206,67 @@ async def quickadd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(QUICKADD_USAGE, parse_mode="Markdown")
         return
 
-    args = raw[1].strip().split()
-    if len(args) < 3:
-        await update.message.reply_text(
-            "⚠️ Need at least 3 parts: *Place*, *Item*, *Price*\n\n" + QUICKADD_USAGE,
-            parse_mode="Markdown",
-        )
-        return
+    tokens = raw[1].strip().split()
 
-    # Check if last arg is an @date tag
+    # Peel off a trailing @date/time tag first — applies to both formats below.
     date_str = None
-    if args[-1].startswith("@"):
-        date_raw = args[-1][1:].strip()
+    if tokens[-1].startswith("@"):
+        date_raw = tokens[-1][1:].strip()
         try:
             date_str = parse_date_input(date_raw)
         except ValueError:
             await update.message.reply_text(
-                f"⚠️ Couldn't read `{date_raw}` as a date.\n"
-                "Try `today`, `yesterday`, or `25-06-2026`.",
+                f"⚠️ Couldn't read `{date_raw}` as a date/time.\n"
+                "Try `today`, `yesterday`, `25-06-2026`, or just a time like `14:30`.",
                 parse_mode="Markdown",
             )
             return
-        args = args[:-1]
-        if len(args) < 3:
+        tokens = tokens[:-1]
+        if not tokens:
             await update.message.reply_text(
-                "⚠️ Need at least 3 parts before the @tag: *Place*, *Item*, *Price*\n\n" + QUICKADD_USAGE,
+                "⚠️ Need at least *Place*, *Item*, *Price* before the @tag\n\n" + QUICKADD_USAGE,
                 parse_mode="Markdown",
             )
             return
 
-    # Check if last remaining arg is a #category tag
+    # Then a trailing #category tag.
     category = ""
-    if args[-1].startswith("#"):
-        category = args[-1][1:].replace("_", " ").strip()
-        args = args[:-1]
-        if len(args) < 3:
+    if tokens[-1].startswith("#"):
+        category = tokens[-1][1:].replace("_", " ").strip()
+        tokens = tokens[:-1]
+        if not tokens:
             await update.message.reply_text(
-                "⚠️ Need at least 3 parts before the #tag: *Place*, *Item*, *Price*\n\n" + QUICKADD_USAGE,
+                "⚠️ Need at least *Place*, *Item*, *Price* before the #tag\n\n" + QUICKADD_USAGE,
                 parse_mode="Markdown",
             )
             return
 
-    place     = args[0]
-    price_raw = args[-1]
-    item      = " ".join(args[1:-1])
+    remainder = " ".join(tokens)
+
+    # Semicolon format handles multi-word PLACE and/or multi-word ITEM unambiguously:
+    # "/q Warung Nasi Padang ; Ayam Bakar Sambal ; 25000"
+    if ";" in remainder:
+        parts = [p.strip() for p in remainder.split(";")]
+        if len(parts) != 3 or not all(parts):
+            await update.message.reply_text(
+                "⚠️ Semicolon format needs exactly 3 non-empty parts: `Place ; Item ; Price`\n\n"
+                + QUICKADD_USAGE,
+                parse_mode="Markdown",
+            )
+            return
+        place, item, price_raw = parts
+    else:
+        args = remainder.split()
+        if len(args) < 3:
+            await update.message.reply_text(
+                "⚠️ Need at least 3 parts: *Place*, *Item*, *Price*\n"
+                "Multi-word place name? Use `Place ; Item ; Price` instead.\n\n" + QUICKADD_USAGE,
+                parse_mode="Markdown",
+            )
+            return
+        place     = args[0]
+        price_raw = args[-1]
+        item      = " ".join(args[1:-1])
 
     try:
         price = parse_price(price_raw)
@@ -264,7 +283,7 @@ async def quickadd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sheet_name = active_sheet_name(chat_id)
     sheets.append_expense(sheet_name, place, item, price, sender, sender, price, status="✅ Paid", category=category, date_str=date_str)
     cat_line  = f"  🏷️ {category}" if category else ""
-    date_line = f"\n📅 {date_str.split(' ')[0]}" if date_str else ""
+    date_line = f"\n📅 {date_str}" if date_str else ""
     await update.message.reply_text(
         f"⚡ *Saved!*\n"
         f"📍 {place} — {item}\n"

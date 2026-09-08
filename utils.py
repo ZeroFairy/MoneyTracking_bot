@@ -37,13 +37,28 @@ def now_wib():
     return datetime.now(timezone.utc) + timedelta(hours=WIB_OFFSET_HOURS)
 
 
+def _parse_time_token(token: str):
+    """Parses an 'HH:MM' token into (hour, minute) ints. Raises ValueError if invalid."""
+    try:
+        hh_str, mm_str = token.split(":")
+        hh, mm = int(hh_str), int(mm_str)
+        if not (0 <= hh <= 23 and 0 <= mm <= 59):
+            raise ValueError
+        return hh, mm
+    except ValueError:
+        raise ValueError(f"Could not parse time from: {token!r}")
+
+
 def parse_date_input(raw: str) -> str:
-    """Parse a user-supplied date (and optional time) into a 'DD-MM-YYYY HH:MM' string.
+    """Parse a user-supplied date and/or time into a 'DD-MM-YYYY HH:MM' string.
 
     Date part accepts: "today", "now", "yesterday", or an explicit "DD-MM-YYYY".
     An optional second token gives the time as "HH:MM" — if omitted, the current
     WIB time-of-day is used. Examples: "today", "yesterday 09:00", "25-06-2026",
     "25-06-2026 14:30".
+
+    A single bare "HH:MM" token (no date part) means "today at that time" —
+    e.g. "14:30" -> today's date at 14:30 WIB.
     """
     from datetime import datetime, timedelta
 
@@ -51,9 +66,15 @@ def parse_date_input(raw: str) -> str:
     if not parts:
         raise ValueError(f"Could not parse date from: {raw!r}")
 
+    now = now_wib()
+
+    # Bare time only, e.g. "14:30" — no date word, so assume today.
+    if len(parts) == 1 and ":" in parts[0] and parts[0].lower() not in ("today", "now", "yesterday"):
+        hh, mm = _parse_time_token(parts[0])
+        return f"{now.strftime('%d-%m-%Y')} {hh:02d}:{mm:02d}"
+
     date_token = parts[0].lower()
     time_token = parts[1] if len(parts) > 1 else None
-    now = now_wib()
 
     if date_token in ("today", "now"):
         date_part = now.date()
@@ -66,13 +87,7 @@ def parse_date_input(raw: str) -> str:
             raise ValueError(f"Could not parse date from: {raw!r}")
 
     if time_token:
-        try:
-            hh_str, mm_str = time_token.split(":")
-            hh, mm = int(hh_str), int(mm_str)
-            if not (0 <= hh <= 23 and 0 <= mm <= 59):
-                raise ValueError
-        except ValueError:
-            raise ValueError(f"Could not parse time from: {time_token!r}")
+        hh, mm = _parse_time_token(time_token)
         time_str = f"{hh:02d}:{mm:02d}"
     else:
         time_str = now.strftime("%H:%M")
