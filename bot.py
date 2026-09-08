@@ -654,14 +654,19 @@ async def list_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 DELETE_PAGE_SIZE = 8
 
 
-def _delete_keyboard(all_rows, page, name):
+def _delete_keyboard(all_rows, page):
     total_pages = max(1, -(-len(all_rows) // DELETE_PAGE_SIZE))
     page_rows   = all_rows[page * DELETE_PAGE_SIZE:(page + 1) * DELETE_PAGE_SIZE]
     kb = []
     for row_num, row in page_rows:
         item  = row[2] if len(row) > 2 else "?"
         price = row[3] if len(row) > 3 else "?"
-        kb.append([InlineKeyboardButton(f"🗑️ #{_disp(row_num)} {item} ({price})", callback_data=f"del:{name}:{row_num}")])
+        # Only the row number goes in callback_data — the sheet name is read
+        # back from chat_data. Telegram caps callback_data at 64 bytes, and
+        # custom sheet names (via /newevent) can run up to 90 chars, so
+        # embedding the name directly here would crash this keyboard entirely
+        # for any chat using a long custom sheet name.
+        kb.append([InlineKeyboardButton(f"🗑️ #{_disp(row_num)} {item} ({price})", callback_data=f"del:{row_num}")])
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton("◀ Newer", callback_data=f"delpage:{page - 1}"))
@@ -682,7 +687,7 @@ async def delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     context.chat_data["del_rows"]  = all_rows
     context.chat_data["del_sheet"] = name
-    kb, total_pages = _delete_keyboard(all_rows, 0, name)
+    kb, total_pages = _delete_keyboard(all_rows, 0)
     await update.message.reply_text(
         f"🗑️ *Delete an entry* — *{name}*\nPage 1/{total_pages}",
         parse_mode="Markdown", reply_markup=kb,
@@ -700,7 +705,7 @@ async def delete_page_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         all_rows = sheets.get_all_expenses(name)
         context.chat_data["del_rows"]  = all_rows
         context.chat_data["del_sheet"] = name
-    kb, total_pages = _delete_keyboard(all_rows, page, name)
+    kb, total_pages = _delete_keyboard(all_rows, page)
     await query.edit_message_text(
         f"🗑️ *Delete an entry* — *{name}*\nPage {page + 1}/{total_pages}",
         parse_mode="Markdown", reply_markup=kb,
@@ -710,12 +715,13 @@ async def delete_page_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    _, name, row_num = query.data.split(":")
-    sheets.delete_row(name, int(row_num))
+    row_num = int(query.data.split(":")[1])
+    name    = context.chat_data.get("del_sheet") or active_sheet_name(update.effective_chat.id)
+    sheets.delete_row(name, row_num)
     # Invalidate cached rows since row numbers have shifted
     context.chat_data.pop("del_rows",  None)
     context.chat_data.pop("del_sheet", None)
-    await query.edit_message_text(f"🗑️ Deleted entry #{_disp(int(row_num))} from *{name}*.", parse_mode="Markdown")
+    await query.edit_message_text(f"🗑️ Deleted entry #{_disp(row_num)} from *{name}*.", parse_mode="Markdown")
 
 
 async def delete_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -744,8 +750,13 @@ async def undo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     item  = row[2] if len(row) > 2 else "?"
     price = row[3] if len(row) > 3 else "?"
 
+    # Only the row number goes in callback_data — the sheet name is read back
+    # from chat_data. Telegram caps callback_data at 64 bytes, and custom
+    # sheet names (via /newevent) can run up to 90 chars, so embedding the
+    # name directly here would crash this button for a long custom sheet name.
+    context.chat_data["undo_sheet"] = name
     keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🗑️ Yes, undo it", callback_data=f"undo:{name}:{row_num}"),
+        InlineKeyboardButton("🗑️ Yes, undo it", callback_data=f"undo:{row_num}"),
         InlineKeyboardButton("Cancel", callback_data="undocancel"),
     ]])
     await update.message.reply_text(
@@ -757,10 +768,10 @@ async def undo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def undo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
+    query   = update.callback_query
     await query.answer()
-    _, name, row_num = query.data.split(":")
-    row_num = int(row_num)
+    row_num = int(query.data.split(":")[1])
+    name    = context.chat_data.get("undo_sheet") or active_sheet_name(update.effective_chat.id)
 
     # Re-check it's still the most recent row before deleting — something else
     # may have been added or removed since the confirmation prompt was sent.
@@ -773,12 +784,14 @@ async def undo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     sheets.delete_row(name, row_num)
+    context.chat_data.pop("undo_sheet", None)
     await query.edit_message_text(f"↩️ Undone — removed the last entry from *{name}*.", parse_mode="Markdown")
 
 
 async def undo_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    context.chat_data.pop("undo_sheet", None)
     await query.edit_message_text("Cancelled.")
 
 
@@ -1041,23 +1054,40 @@ async def newevent_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def switch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     titles = sheets.list_sheet_titles()
-    kb = [[InlineKeyboardButton("🏠 Current Month (auto)", callback_data="switch:__default__")]]
-    for t in titles:
-        kb.append([InlineKeyboardButton(t, callback_data=f"switch:{t}")])
+    context.chat_data["switch_titles"] = titles
+    # Only an index goes in callback_data — the sheet name is read back from
+    # chat_data. Telegram caps callback_data at 64 bytes, and custom sheet
+    # names (via /newevent) can run up to 90 chars, so embedding the name
+    # directly here would crash this keyboard for a long custom sheet name.
+    kb = [[InlineKeyboardButton("🏠 Current Month (auto)", callback_data="switch:default")]]
+    for i, t in enumerate(titles):
+        kb.append([InlineKeyboardButton(t, callback_data=f"switch:{i}")])
     await update.message.reply_text("Pick a sheet to switch to:", reply_markup=InlineKeyboardMarkup(kb))
 
 
 async def switch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
+    query   = update.callback_query
     await query.answer()
-    name  = query.data.split(":", 1)[1]
     chat_id = update.effective_chat.id
-    if name == "__default__":
+    token   = query.data.split(":", 1)[1]
+
+    if token == "default":
         state.set_active_sheet(chat_id, None)
         await query.edit_message_text(f"✅ Switched to: {sheets.current_month_sheet_name()}")
-    else:
-        state.set_active_sheet(chat_id, name)
-        await query.edit_message_text(f"✅ Switched to: {name}")
+        return
+
+    titles = context.chat_data.get("switch_titles")
+    if titles is None:
+        titles = sheets.list_sheet_titles()  # fallback if chat_data was lost (e.g. bot restart)
+
+    try:
+        name = titles[int(token)]
+    except (ValueError, IndexError):
+        await query.edit_message_text("⚠️ That option expired — please run /switch again.")
+        return
+
+    state.set_active_sheet(chat_id, name)
+    await query.edit_message_text(f"✅ Switched to: {name}")
 
 
 # ---------------------------------------------------------------------------
