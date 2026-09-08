@@ -84,6 +84,7 @@ HELP_TEXT = (
     "/undo — quickly delete the most recent entry\n"
     "/markpaid — mark entries paid/unpaid or per-person\n"
     "/getlink — get the spreadsheet link\n"
+    "/recap — quick snapshot: entries, grand total, biggest expense, top spender\n"
     "/sortsheet — re-sort the active sheet by date & time\n"
     "/newevent — create a new sheet for a trip/event\n"
     "/switch — switch between sheets\n"
@@ -138,6 +139,39 @@ async def getlink_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Full spreadsheet:\n"
         f"{sheet_url}"
     )
+
+
+async def recap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Quick snapshot of the whole active sheet — total entries, grand total,
+    biggest single expense, top category, and biggest spender. No date
+    filter and no per-category breakdown — that's what /overview is for.
+    """
+    chat_id = update.effective_chat.id
+    name    = active_sheet_name(chat_id)
+    data    = sheets.get_recap(name)
+
+    if data["count"] == 0:
+        await update.message.reply_text(f"No entries yet in *{name}*.", parse_mode="Markdown")
+        return
+
+    lines = [f"📊 *Recap — {name}*", ""]
+    lines.append(f"🧾 Entries: *{data['count']}*")
+    lines.append(f"💰 Grand total: *{format_price(data['grand_total'])}*")
+
+    if data["biggest_expense"]:
+        price, place, item = data["biggest_expense"]
+        lines.append(f"🔥 Biggest expense: *{format_price(price)}* — {place} ({item})")
+
+    if data["top_category"]:
+        cat, total = data["top_category"]
+        lines.append(f"🏷️ Top category: *{cat}* ({format_price(total)})")
+
+    if data["top_spender"]:
+        person, total = data["top_spender"]
+        lines.append(f"🙋 Biggest spender: *{person}* ({format_price(total)})")
+
+    lines.append("\n_Want the full category breakdown? Use /overview._")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def sortsheet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2033,6 +2067,7 @@ def main():
     app.add_handler(CommandHandler("start",      restricted(start_cmd)))
     app.add_handler(CommandHandler("help",       restricted(start_cmd)))
     app.add_handler(CommandHandler("getlink",    restricted(getlink_cmd)))
+    app.add_handler(CommandHandler("recap",      restricted(recap_cmd)))
     app.add_handler(CommandHandler("sheet",      restricted(getlink_cmd)))  # keep old name as alias
     app.add_handler(CommandHandler("sortsheet",  restricted(sortsheet_cmd)))
     app.add_handler(CommandHandler("sort",       restricted(sortsheet_cmd)))  # short alias

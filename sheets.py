@@ -399,3 +399,68 @@ def get_category_overview(sheet_name: str, start_date_str=None, end_date_str=Non
             continue
 
     return dict(sorted(cats.items(), key=lambda x: x[1]["total"], reverse=True))
+
+
+def get_recap(sheet_name: str) -> dict:
+    """Quick snapshot for the whole active sheet, no date filter — total
+    entries, grand total spent (full bill amounts), the single biggest
+    expense, the top category, and the biggest spender (by shared amount,
+    same basis as /totals, regardless of paid status).
+
+    Returns:
+        {
+            "count": int,
+            "grand_total": float,
+            "biggest_expense": (price, place, item) | None,
+            "top_category": (name, total) | None,
+            "top_spender": (name, total) | None,
+        }
+    """
+    ws = get_or_create_worksheet(sheet_name)
+    data = ws.get_all_values()[1:]
+    from utils import parse_price
+
+    count = 0
+    grand_total = 0.0
+    biggest = None  # (price, place, item)
+    cat_totals = {}
+    person_totals = {}
+
+    for row in data:
+        if len(row) < 4 or not any(row):
+            continue
+        try:
+            price = parse_price(row[3])
+        except ValueError:
+            continue
+
+        count += 1
+        grand_total += price
+        place = row[1] if len(row) > 1 else "?"
+        item  = row[2] if len(row) > 2 else "?"
+        if biggest is None or price > biggest[0]:
+            biggest = (price, place, item)
+
+        category = row[10].strip() if len(row) > 10 and row[10].strip() else "Uncategorized"
+        cat_totals[category] = cat_totals.get(category, 0.0) + price
+
+        shared_by_str = row[5].strip() if len(row) > 5 else ""
+        amt_str = row[6].strip() if len(row) > 6 else ""
+        if shared_by_str and amt_str and amt_str != "-":
+            try:
+                amt_per_person = parse_price(amt_str)
+                for person in [s.strip() for s in shared_by_str.split(",") if s.strip()]:
+                    person_totals[person] = person_totals.get(person, 0.0) + amt_per_person
+            except ValueError:
+                pass
+
+    top_category = max(cat_totals.items(), key=lambda x: x[1]) if cat_totals else None
+    top_spender  = max(person_totals.items(), key=lambda x: x[1]) if person_totals else None
+
+    return {
+        "count": count,
+        "grand_total": grand_total,
+        "biggest_expense": biggest,
+        "top_category": top_category,
+        "top_spender": top_spender,
+    }
