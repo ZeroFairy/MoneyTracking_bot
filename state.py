@@ -154,3 +154,19 @@ def delete_total_budget(chat_id: int) -> bool:
     del data[key]
     _save(data)
     return True
+
+
+# ── Known chats (so we can broadcast things like "new month started") ────────
+
+def mark_known_chat(chat_id: int) -> None:
+    """Records that this chat has used the bot at least once."""
+    data = _load()
+    known = set(data.get("known_chats", []))
+    if chat_id not in known:
+        known.add(chat_id)
+        data["known_chats"] = list(known)
+        _save(data)
+
+
+def get_known_chats() -> list:
+    return _load().get("known_chats", [])

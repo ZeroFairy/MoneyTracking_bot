@@ -17,7 +17,7 @@ from telegram.ext import (
 import config
 import sheets
 import state
-from utils import format_price, parse_price, parse_date_input
+from utils import format_price, parse_price, parse_date_input, now_wib
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -101,8 +101,17 @@ HELP_TEXT = (
 
 
 def active_sheet_name(chat_id: int) -> str:
+    """The chat's active sheet. No longer silently follows the calendar —
+    once set, it stays fixed until the user explicitly runs /switch, even
+    after a new month starts. First-ever use for a chat is bootstrapped to
+    the current month, saved explicitly right away.
+    """
     name = state.get_active_sheet(chat_id)
-    return name if name else sheets.current_month_sheet_name()
+    if name:
+        return name
+    name = sheets.current_month_sheet_name()
+    state.set_active_sheet(chat_id, name)
+    return name
 
 
 def _disp(row_num: int) -> int:
@@ -118,6 +127,7 @@ def restricted(func):
         if config.ALLOWED_CHAT_IDS and chat_id not in config.ALLOWED_CHAT_IDS:
             await update.message.reply_text("🔒 Sorry, this bot is private.")
             return ConversationHandler.END
+        state.mark_known_chat(chat_id)  # so the monthly new-sheet nudge knows who to message
         return await func(update, context, *a, **kw)
     return wrapper
 
@@ -1063,7 +1073,8 @@ async def switch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # chat_data. Telegram caps callback_data at 64 bytes, and custom sheet
     # names (via /newevent) can run up to 90 chars, so embedding the name
     # directly here would crash this keyboard for a long custom sheet name.
-    kb = [[InlineKeyboardButton("🏠 Current Month (auto)", callback_data="switch:default")]]
+    this_month = sheets.current_month_sheet_name()
+    kb = [[InlineKeyboardButton(f"📅 This month ({this_month})", callback_data="switch:thismonth")]]
     for i, t in enumerate(titles):
         kb.append([InlineKeyboardButton(t, callback_data=f"switch:{i}")])
     await update.message.reply_text("Pick a sheet to switch to:", reply_markup=InlineKeyboardMarkup(kb))
@@ -1075,9 +1086,14 @@ async def switch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     token   = query.data.split(":", 1)[1]
 
-    if token == "default":
-        state.set_active_sheet(chat_id, None)
-        await query.edit_message_text(f"✅ Switched to: {sheets.current_month_sheet_name()}")
+    if token == "thismonth":
+        # Explicit switch to whichever month it is right now — this is a
+        # one-time snapshot, not an ongoing "auto-follow the calendar"
+        # setting. It'll stay pinned here until you /switch again, even
+        # once next month starts.
+        name = sheets.current_month_sheet_name()
+        state.set_active_sheet(chat_id, name)
+        await query.edit_message_text(f"✅ Switched to: {name}")
         return
 
     titles = context.chat_data.get("switch_titles")
@@ -1799,6 +1815,38 @@ def _job_name(chat_id: int, reminder_id: str) -> str:
     return f"reminder_{chat_id}_{reminder_id}"
 
 
+# ---------------------------------------------------------------------------
+# New-month nudge — runs once a day; on the 1st of the month (WIB) it messages
+# every chat that's ever used the bot. The active sheet no longer auto-follows
+# the calendar (see active_sheet_name) — it stays fixed on whatever it was
+# last explicitly set to, so a manual /switch is always required to move to
+# the new month's sheet. This is purely a reminder to do that; it doesn't
+# switch anything on your behalf.
+# ---------------------------------------------------------------------------
+
+async def _new_month_check(context):
+    now = now_wib()
+    if now.day != 1:
+        return
+
+    month_name = sheets.current_month_sheet_name()
+    for chat_id in state.get_known_chats():
+        current = state.get_active_sheet(chat_id)
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"🗓️ *New month started — {month_name}*\n\n"
+                    f"Your active sheet is still *{current}* — it won't switch on its own. "
+                    f"Run /switch and pick *📅 This month ({month_name})* when you're "
+                    f"ready to start logging into the new tab."
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception:
+            logger.warning(f"Could not send new-month nudge to chat {chat_id}", exc_info=True)
+
+
 def _schedule_one(app, chat_id: int, reminder: dict):
     """Schedule a single reminder dict. Replaces existing job with same ID."""
     if app.job_queue is None:
@@ -2289,6 +2337,16 @@ def main():
                 logger.info(f"Restored reminder for chat {chat_id} at {hour_wib:02d}:{reminder['minute']:02d} WIB")
             except Exception as e:
                 logger.warning(f"Could not restore reminder {reminder.get('id')} for chat {chat_id}: {e}")
+
+    # Daily check for "is it the 1st of the month" — 17:00 UTC = 00:00 WIB
+    if app.job_queue is not None:
+        app.job_queue.run_daily(
+            _new_month_check,
+            time=datetime.time(hour=17, minute=0, tzinfo=datetime.timezone.utc),
+            name="new_month_check",
+        )
+    else:
+        logger.warning("JobQueue not available — the new-month nudge won't fire.")
 
     app.add_handler(CommandHandler("start",      restricted(start_cmd)))
     app.add_handler(CommandHandler("help",       restricted(start_cmd)))
