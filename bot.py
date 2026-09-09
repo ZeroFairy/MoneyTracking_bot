@@ -85,6 +85,8 @@ HELP_TEXT = (
     "/markpaid — mark entries paid/unpaid or per-person\n"
     "/getlink — get the spreadsheet link\n"
     "/recap — quick snapshot: entries, grand total, biggest expense, top spender\n"
+    "/setbudget Category Amount — set a monthly cap per category, with 80%/100% alerts\n"
+    "/budgets — see all budgets and current usage\n"
     "/sortsheet — re-sort the active sheet by date & time\n"
     "/newevent — create a new sheet for a trip/event\n"
     "/switch — switch between sheets\n"
@@ -319,11 +321,13 @@ async def quickadd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sheets.append_expense(sheet_name, place, item, price, sender, sender, price, status="✅ Paid", category=category, date_str=date_str)
     cat_line  = f"  🏷️ {category}" if category else ""
     date_line = f"\n📅 {date_str}" if date_str else ""
+    warning = _budget_warnings(chat_id, sheet_name, category)
     await update.message.reply_text(
         f"⚡ *Saved!*\n"
         f"📍 {place} — {item}\n"
         f"💰 {format_price(price)}  |  🙋 {sender}{cat_line}\n"
-        f"📋 Sheet: {sheet_name}{date_line}",
+        f"📋 Sheet: {sheet_name}{date_line}"
+        f"{warning}",
         parse_mode="Markdown",
     )
 
@@ -1434,12 +1438,14 @@ async def add_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     draft      = context.chat_data.pop("draft")
     chat_id    = update.effective_chat.id
     sheet_name = active_sheet_name(chat_id)
+    category   = draft.get("category", "")
     sheets.append_expense(
         sheet_name, draft["place"], draft["item"], draft["price"],
         draft["paid_by"], ", ".join(draft["shared_by"]), draft["amount_per_person"],
-        category=draft.get("category", ""), date_str=draft.get("date_str"),
+        category=category, date_str=draft.get("date_str"),
     )
-    await query.edit_message_text(f"✅ Saved to *{sheet_name}*!", parse_mode="Markdown")
+    warning = _budget_warnings(chat_id, sheet_name, category)
+    await query.edit_message_text(f"✅ Saved to *{sheet_name}*!{warning}", parse_mode="Markdown")
     return ConversationHandler.END
 
 
@@ -1641,7 +1647,8 @@ async def split_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     await query.edit_message_text(
         f"✅ Saved {len(split['items'])} item(s) to *{sheet_name}*!"
-        + (f"\n_(prices include {tax_pct}% tax, split proportionally)_" if tax_pct else ""),
+        + (f"\n_(prices include {tax_pct}% tax, split proportionally)_" if tax_pct else "")
+        + _budget_warnings(chat_id, sheet_name, cat),
         parse_mode="Markdown",
     )
     return ConversationHandler.END
@@ -1749,10 +1756,12 @@ async def even_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     even       = context.chat_data.pop("even")
     chat_id    = update.effective_chat.id
     sheet_name = active_sheet_name(chat_id)
+    category   = even.get("category", "")
     sheets.append_expense(sheet_name, even["place"], even["label"], even["total"],
                           even["payer"], ", ".join(even["names"]), even["per_person"],
-                          category=even.get("category", ""))
-    await query.edit_message_text(f"✅ Saved to *{sheet_name}*!", parse_mode="Markdown")
+                          category=category)
+    warning = _budget_warnings(chat_id, sheet_name, category)
+    await query.edit_message_text(f"✅ Saved to *{sheet_name}*!{warning}", parse_mode="Markdown")
     return ConversationHandler.END
 
 
@@ -2045,6 +2054,193 @@ async def execute_overview(chat_id, context, message_obj, start_date_str, end_da
 
 
 # ---------------------------------------------------------------------------
+# /setbudget  /budgets — per-category spending caps with 80%/100% warnings
+# ---------------------------------------------------------------------------
+
+def _find_budget(chat_id: int, category: str):
+    """Case-insensitive lookup. Returns the amount, or None if not set."""
+    if not category:
+        return None
+    for cat, amt in state.get_budgets(chat_id).items():
+        if cat.lower() == category.lower():
+            return amt
+    return None
+
+
+def _budget_warning(chat_id: int, sheet_name: str, category: str) -> str:
+    """Returns an extra text block to append to a save confirmation if this
+    category has now hit 80% or 100% of its budget in the active sheet.
+    Returns '' if no budget is set for this category, or it's still under 80%.
+    """
+    limit = _find_budget(chat_id, category)
+    if limit is None or limit <= 0:
+        return ""
+    cats  = sheets.get_category_overview(sheet_name)
+    spent = 0.0
+    for cat, info in cats.items():
+        if cat.lower() == category.lower():
+            spent = info["total"]
+            break
+    pct = spent / limit * 100
+    if pct >= 100:
+        return (f"\n\n🔴 *Budget alert:* {category} is now {format_price(spent)} / "
+                f"{format_price(limit)} ({pct:.0f}%) — over budget!")
+    if pct >= 80:
+        return (f"\n\n🟡 *Budget heads-up:* {category} is now {format_price(spent)} / "
+                f"{format_price(limit)} ({pct:.0f}%) of budget.")
+    return ""
+
+
+def _overall_budget_warning(chat_id: int, sheet_name: str) -> str:
+    """Same idea as _budget_warning, but against a single cap spanning ALL
+    categories combined, tracked separately via /setbudget <amount> (no
+    category given).
+    """
+    limit = state.get_total_budget(chat_id)
+    if not limit or limit <= 0:
+        return ""
+    spent = sheets.get_recap(sheet_name)["grand_total"]
+    pct   = spent / limit * 100
+    if pct >= 100:
+        return (f"\n\n🔴 *Overall budget alert:* {format_price(spent)} / "
+                f"{format_price(limit)} ({pct:.0f}%) — over budget!")
+    if pct >= 80:
+        return (f"\n\n🟡 *Overall budget heads-up:* {format_price(spent)} / "
+                f"{format_price(limit)} ({pct:.0f}%) of budget.")
+    return ""
+
+
+def _budget_warnings(chat_id: int, sheet_name: str, category: str) -> str:
+    """Combined per-category + overall budget alert text, appended after saving."""
+    return _budget_warning(chat_id, sheet_name, category) + _overall_budget_warning(chat_id, sheet_name)
+
+
+SETBUDGET_USAGE = (
+    "💰 *Set Budget usage:*\n"
+    "`/setbudget Category Amount` — cap for one category\n"
+    "`/setbudget Amount` — one overall cap across *all* categories\n\n"
+    "*Examples:*\n"
+    "`/setbudget Food 1000000`\n"
+    "`/setbudget Transport 500k`\n"
+    "`/setbudget 3000000` _(overall monthly cap)_\n\n"
+    "You'll get a heads-up once spending (within the active sheet) passes "
+    "*80%*, and an alert at *100%* — checked separately for each category "
+    "budget and for the overall budget.\n\n"
+    "Remove a budget by setting it to `0`: `/setbudget Food 0` or `/setbudget 0`\n"
+    "See all budgets and current usage with /budgets."
+)
+
+
+async def setbudget_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    text    = update.message.text.strip()
+    raw     = text.split(None, 1)
+
+    if len(raw) < 2 or not raw[1].strip():
+        await update.message.reply_text(SETBUDGET_USAGE, parse_mode="Markdown")
+        return
+
+    parts = raw[1].strip().split()
+
+    # Single token, no category -> overall budget across ALL categories combined
+    if len(parts) == 1:
+        try:
+            amount = parse_price(parts[0])
+        except ValueError:
+            await update.message.reply_text(
+                f"⚠️ Couldn't read `{parts[0]}` as an amount.\n"
+                "Try formats like `1000000`, `1.000.000`, or `1m`/`1000k`.",
+                parse_mode="Markdown",
+            )
+            return
+        if amount <= 0:
+            removed = state.delete_total_budget(chat_id)
+            await update.message.reply_text(
+                "🗑️ Overall budget removed." if removed else "No overall budget was set.",
+            )
+            return
+        state.set_total_budget(chat_id, amount)
+        await update.message.reply_text(
+            f"✅ Overall budget set: {format_price(amount)} across *all* categories\n"
+            f"_(tracked against the active sheet's grand total — heads-up at 80%, alert at 100%)_",
+            parse_mode="Markdown",
+        )
+        return
+
+    price_raw = parts[-1]
+    category  = " ".join(parts[:-1]).strip()
+
+    try:
+        amount = parse_price(price_raw)
+    except ValueError:
+        await update.message.reply_text(
+            f"⚠️ Couldn't read `{price_raw}` as an amount.\n"
+            "Try formats like `1000000`, `1.000.000`, or `1m`/`1000k`.",
+            parse_mode="Markdown",
+        )
+        return
+
+    if amount <= 0:
+        removed = state.delete_budget(chat_id, category)
+        if not removed:
+            # try case-insensitive match too, since the user may retype the category differently
+            for existing in list(state.get_budgets(chat_id).keys()):
+                if existing.lower() == category.lower():
+                    state.delete_budget(chat_id, existing)
+                    removed = True
+                    break
+        if removed:
+            await update.message.reply_text(f"🗑️ Budget removed for *{category}*.", parse_mode="Markdown")
+        else:
+            await update.message.reply_text(f"No budget was set for *{category}*.", parse_mode="Markdown")
+        return
+
+    state.set_budget(chat_id, category, amount)
+    await update.message.reply_text(
+        f"✅ Budget set: *{category}* → {format_price(amount)}\n"
+        f"_(tracked against the active sheet — you'll get a heads-up at 80% and 100%)_",
+        parse_mode="Markdown",
+    )
+
+
+async def budgets_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id      = update.effective_chat.id
+    budgets      = state.get_budgets(chat_id)
+    total_limit  = state.get_total_budget(chat_id)
+    if not budgets and not total_limit:
+        await update.message.reply_text(
+            "No budgets set yet.\n\n" + SETBUDGET_USAGE, parse_mode="Markdown",
+        )
+        return
+
+    name = active_sheet_name(chat_id)
+
+    def _bar_line(label, spent, limit):
+        pct    = (spent / limit * 100) if limit else 0
+        filled = min(10, int(pct / 10))
+        bar    = "█" * filled + "░" * (10 - filled)
+        emoji  = "🔴" if pct >= 100 else ("🟡" if pct >= 80 else "🟢")
+        return f"{emoji} *{label}*\n   {bar} {pct:.0f}%\n   {format_price(spent)} / {format_price(limit)}"
+
+    lines = [f"💰 *Budgets — {name}*\n"]
+
+    if total_limit:
+        grand_total = sheets.get_recap(name)["grand_total"]
+        lines.append(_bar_line("Overall (all categories)", grand_total, total_limit))
+        if budgets:
+            lines.append("")  # blank line before the per-category breakdown
+
+    if budgets:
+        cats = sheets.get_category_overview(name)
+        spent_by_lower = {c.lower(): v["total"] for c, v in cats.items()}
+        for cat, limit in budgets.items():
+            spent = spent_by_lower.get(cat.lower(), 0.0)
+            lines.append(_bar_line(cat, spent, limit))
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ---------------------------------------------------------------------------
 # Error handler
 # ---------------------------------------------------------------------------
 
@@ -2098,6 +2294,8 @@ def main():
     app.add_handler(CommandHandler("help",       restricted(start_cmd)))
     app.add_handler(CommandHandler("getlink",    restricted(getlink_cmd)))
     app.add_handler(CommandHandler("recap",      restricted(recap_cmd)))
+    app.add_handler(CommandHandler("setbudget",  restricted(setbudget_cmd)))
+    app.add_handler(CommandHandler("budgets",    restricted(budgets_cmd)))
     app.add_handler(CommandHandler("sheet",      restricted(getlink_cmd)))  # keep old name as alias
     app.add_handler(CommandHandler("sortsheet",  restricted(sortsheet_cmd)))
     app.add_handler(CommandHandler("sort",       restricted(sortsheet_cmd)))  # short alias

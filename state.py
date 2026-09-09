@@ -99,3 +99,58 @@ def get_all_reminders() -> dict:
             except ValueError:
                 pass
     return result
+
+
+# ── Budgets (per chat, per category) ──────────────────────────────────────────
+# Stored as: "budgets_{chat_id}": {category: amount}
+
+def get_budgets(chat_id: int) -> dict:
+    """Returns {category: amount} for this chat, or {} if none set."""
+    return _load().get(f"budgets_{chat_id}", {})
+
+
+def set_budget(chat_id: int, category: str, amount: float) -> None:
+    data    = _load()
+    key     = f"budgets_{chat_id}"
+    budgets = data.get(key, {})
+    budgets[category] = amount
+    data[key] = budgets
+    _save(data)
+
+
+def delete_budget(chat_id: int, category: str) -> bool:
+    """Removes a budget by exact category match. Returns True if it existed."""
+    data    = _load()
+    key     = f"budgets_{chat_id}"
+    budgets = data.get(key, {})
+    if category not in budgets:
+        return False
+    del budgets[category]
+    data[key] = budgets
+    _save(data)
+    return True
+
+
+# ── Overall budget (across ALL categories combined) ──────────────────────────
+# Stored separately from per-category budgets as: "budget_total_{chat_id}": amount
+
+def get_total_budget(chat_id: int):
+    """Returns the overall budget amount for this chat, or None if not set."""
+    return _load().get(f"budget_total_{chat_id}")
+
+
+def set_total_budget(chat_id: int, amount: float) -> None:
+    data = _load()
+    data[f"budget_total_{chat_id}"] = amount
+    _save(data)
+
+
+def delete_total_budget(chat_id: int) -> bool:
+    """Removes the overall budget. Returns True if it existed."""
+    data = _load()
+    key  = f"budget_total_{chat_id}"
+    if key not in data:
+        return False
+    del data[key]
+    _save(data)
+    return True
