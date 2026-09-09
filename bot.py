@@ -234,12 +234,15 @@ QUICKADD_USAGE = (
     "`/q Indomaret Aqua 5000 @yesterday`\n"
     "`/q Cafe Kopi 20000 #food @25-06-2026`\n"
     "`/q Cafe Kopi 20000 @14:30` _(today, at 14:30)_\n"
+    "`/q Cafe Kopi 20000 @25-06-2026 @14:30` _(specific date AND time)_\n"
     "`/q Warung Nasi Padang ; Ayam Bakar Sambal ; 25000` _(multi-word place & item)_\n\n"
     "• First word = place, last word = price, everything in between = item\n"
     "• Place or item has more than one word? Use `Place ; Item ; Price` instead\n"
     "• Add `#tag` at the end to set a category (optional)\n"
     "• Add `@date` at the end for a backdated entry — `@today`, `@yesterday`, "
     "`@DD-MM-YYYY`, or just `@HH:MM` for today at that time (optional, defaults to right now)\n"
+    "• Need both a specific date AND time? Add both as separate tags, date first: "
+    "`@25-06-2026 @14:30`\n"
     "• You are set as payer and sole sharer\n"
     "• Use /add instead if others are sharing the cost"
 )
@@ -255,20 +258,25 @@ async def quickadd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     tokens = raw[1].strip().split()
 
-    # Peel off a trailing @date/time tag first — applies to both formats below.
+    # Peel off ALL trailing @tags — supports one combined tag (@yesterday,
+    # @14:30, @25-06-2026) as well as a separate date + time given as two
+    # tags (@25-06-2026 @14:30), which are joined back into "25-06-2026 14:30"
+    # before parsing.
     date_str = None
-    if tokens[-1].startswith("@"):
-        date_raw = tokens[-1][1:].strip()
+    date_tags = []
+    while tokens and tokens[-1].startswith("@"):
+        date_tags.insert(0, tokens.pop()[1:].strip())
+    if date_tags:
+        date_raw = " ".join(date_tags)
         try:
             date_str = parse_date_input(date_raw)
         except ValueError:
             await update.message.reply_text(
                 f"⚠️ Couldn't read `{date_raw}` as a date/time.\n"
-                "Try `today`, `yesterday`, `25-06-2026`, or just a time like `14:30`.",
+                "Try `today`, `yesterday`, `25-06-2026`, `25-06-2026 14:30`, or just a time like `14:30`.",
                 parse_mode="Markdown",
             )
             return
-        tokens = tokens[:-1]
         if not tokens:
             await update.message.reply_text(
                 "⚠️ Need at least *Place*, *Item*, *Price* before the @tag\n\n" + QUICKADD_USAGE,
