@@ -51,6 +51,39 @@ PRESET_CATEGORIES = [
     ("📦 Other",             "Other"),
 ]
 
+# Short-tag aliases so /q's #tag lines up with the exact preset names used by
+# /add's category buttons (matters for /overview and /budgets, which group
+# and match categories by exact, case-insensitive name — "Food Drink" typed
+# via /q would otherwise show up as a separate category from "Food & Drink"
+# picked via /add's buttons).
+_CATEGORY_ALIASES = {
+    "food":             "Food & Drink",
+    "fooddrink":        "Food & Drink",
+    "drink":            "Food & Drink",
+    "transport":        "Transport",
+    "transportation":   "Transport",
+    "shopping":         "Shopping",
+    "household":        "Household",
+    "health":           "Health",
+    "entertainment":    "Entertainment",
+    "bills":            "Bills & Utilities",
+    "billsutilities":   "Bills & Utilities",
+    "utilities":        "Bills & Utilities",
+    "other":            "Other",
+}
+
+
+def _normalize_category(raw: str) -> str:
+    """Snaps a typed category (e.g. /q's #tag, or a typed custom category) to
+    the exact preset name if it's a recognizable match, so it stays consistent
+    with categories picked via /add's buttons. Falls back to the text as
+    typed (with underscores turned into spaces) if nothing matches.
+    """
+    if not raw:
+        return raw
+    key = raw.lower().replace("_", "").replace("&", "").replace(" ", "").replace("-", "")
+    return _CATEGORY_ALIASES.get(key, raw.replace("_", " ").strip())
+
 
 def _category_keyboard(callback_prefix: str = "cat"):
     """Inline keyboard with preset category buttons + custom option."""
@@ -225,6 +258,10 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+_QUICKADD_CATEGORY_LINE = "• Categories: " + ", ".join(
+    f"#{value.lower().replace(' & ', '').replace(' ', '')}" for _, value in PRESET_CATEGORIES
+) + " (or any custom word)\n"
+
 QUICKADD_USAGE = (
     "⚡ *Quick Add usage:*\n"
     "`/q Place Item Price`\n"
@@ -244,6 +281,8 @@ QUICKADD_USAGE = (
     "• First word = place, last word = price, everything in between = item\n"
     "• Place or item has more than one word? Use `Place ; Item ; Price` instead\n"
     "• Add `#tag` at the end to set a category (optional)\n"
+    + _QUICKADD_CATEGORY_LINE +
+    "  _(these line up with the same categories /add uses, so /overview and /budgets stay consistent)_\n"
     "• Add `@date` at the end for a backdated entry — `@today`, `@yesterday`, "
     "`@DD-MM-YYYY`, or just `@HH:MM` for today at that time (optional, defaults to right now)\n"
     "• Need both a specific date AND time? Add both as separate tags, date first: "
@@ -292,7 +331,7 @@ async def quickadd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Then a trailing #category tag.
     category = ""
     if tokens[-1].startswith("#"):
-        category = tokens[-1][1:].replace("_", " ").strip()
+        category = _normalize_category(tokens[-1][1:].strip())
         tokens = tokens[:-1]
         if not tokens:
             await update.message.reply_text(
@@ -493,8 +532,20 @@ async def edit_pick_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return EDIT_FIELD
 
 
+EDIT_HINTS = {
+    "date":       " (e.g. `25-06-2026`, `25-06-2026 14:30`, `today`, `yesterday`)",
+    "place":      " (e.g. `Indomaret`)",
+    "item":       " (e.g. `Aqua Botol`)",
+    "price":      " (e.g. `25000`, `25.000`, or `25k`)",
+    "paid_by":    " (a name, e.g. `Andi`)",
+    "shared":     " (comma-separated names, e.g. `Andi, Budi`)",
+    "per_person": " (e.g. `12500` or `12.5k`)",
+    "category":   "",  # category uses button picker instead of a typed hint
+}
+
+
 async def edit_pick_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User picked a field — ask for the new value."""
+    """User picked a field — ask for the new value (or, for category, show a picker)."""
     query   = update.callback_query
     await query.answer()
     parts   = query.data.split(":", 2)   # editfield:ROWNUM:FIELDKEY
@@ -502,12 +553,7 @@ async def edit_pick_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     field   = parts[2]
     label, _, needs_price = EDIT_FIELDS[field]
     context.chat_data["edit_field"] = field
-    if needs_price:
-        hint = " (e.g. 25000 or 25k)"
-    elif field == "date":
-        hint = " (e.g. 25-06-2026 or 25-06-2026 14:30, or `today` / `yesterday`)"
-    else:
-        hint = ""
+
     row     = context.chat_data.get("edit_row", [])
     field_values = {
         "date":       row[0]  if len(row) > 0  else "?",
@@ -520,6 +566,21 @@ async def edit_pick_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "category":   row[10] if len(row) > 10 else "",
     }
     current = field_values.get(field, "?")
+
+    if field == "category":
+        # Show the same preset buttons /add uses, instead of asking to type
+        # free text — avoids typos and category-name mismatches with /overview
+        # and /budgets, which match category names exactly (case-insensitive).
+        await query.edit_message_text(
+            f"✏️ Editing *{label}* for entry #{_disp(row_num)}\n"
+            f"Current value: `{current or '(none)'}`\n\n"
+            f"Pick a category, or type your own:",
+            parse_mode="Markdown",
+            reply_markup=_category_keyboard("editcat"),
+        )
+        return EDIT_VALUE
+
+    hint = EDIT_HINTS.get(field, "")
     await query.edit_message_text(
         f"✏️ Editing *{label}* for entry #{_disp(row_num)}\n"
         f"Current value: `{current}`\n\n"
@@ -529,12 +590,55 @@ async def edit_pick_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return EDIT_VALUE
 
 
+async def edit_category_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles a preset category button tap while editing the category field."""
+    query = update.callback_query
+    await query.answer()
+    value = query.data.split(":", 1)[1]
+    if value == "__custom__":
+        await query.edit_message_text("✍️ Type your custom category:")
+        return EDIT_VALUE
+
+    async def _send(text, **kw):
+        await query.edit_message_text(text, **kw)
+
+    return await _finish_edit(context, _send, value)
+
+
+async def _finish_edit(context: ContextTypes.DEFAULT_TYPE, send, save_value: str):
+    """Shared save + cleanup for /edit, used by both the typed-value path and
+    the category button path. `send(text, **kwargs)` delivers the result back
+    to the user regardless of which path triggered it. Wrapped in try/except
+    so an unexpected error can't strand the /edit conversation the way an
+    unhandled exception here previously did (e.g. a field with no column
+    mapping in sheets.py).
+    """
+    field   = context.chat_data.get("edit_field", "")
+    row_num = context.chat_data.get("edit_row_num")
+    name    = context.chat_data.get("edit_sheet", "")
+    label   = EDIT_FIELDS.get(field, ("that field",))[0]
+
+    for k in ("edit_sheet", "edit_rows", "edit_page", "edit_row_num", "edit_row", "edit_field"):
+        context.chat_data.pop(k, None)
+
+    try:
+        sheets.update_expense_field(name, row_num, field, save_value)
+    except Exception:
+        logger.exception(f"Failed to save /edit for field={field!r}")
+        await send("❌ Something went wrong saving that — please run /edit again.")
+        return ConversationHandler.END
+
+    await send(
+        f"✅ *Updated!*\n{label} → `{save_value}`\n_(entry #{_disp(row_num)} in {name})_",
+        parse_mode="Markdown",
+    )
+    return ConversationHandler.END
+
+
 async def edit_save_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """User typed a new value — validate and save."""
     raw_value = update.message.text.strip()
     field     = context.chat_data.get("edit_field", "")
-    row_num   = context.chat_data.get("edit_row_num")
-    name      = context.chat_data.get("edit_sheet", "")
     label, _, needs_price = EDIT_FIELDS[field]
 
     if needs_price:
@@ -557,17 +661,10 @@ async def edit_save_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         save_value = raw_value
 
-    sheets.update_expense_field(name, row_num, field, save_value)
+    async def _send(text, **kw):
+        await update.message.reply_text(text, **kw)
 
-    # Clean up
-    for k in ("edit_sheet", "edit_rows", "edit_page", "edit_row_num", "edit_row", "edit_field"):
-        context.chat_data.pop(k, None)
-
-    await update.message.reply_text(
-        f"✅ *Updated!*\n{label} → `{save_value}`\n_(entry #{_disp(row_num)} in {name})_",
-        parse_mode="Markdown",
-    )
-    return ConversationHandler.END
+    return await _finish_edit(context, _send, save_value)
 
 
 async def edit_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2437,6 +2534,7 @@ def main():
                 CallbackQueryHandler(edit_cancel,     pattern=r"^editcancel$"),
             ],
             EDIT_VALUE: [
+                CallbackQueryHandler(edit_category_button, pattern=r"^editcat:"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, edit_save_value),
             ],
         },

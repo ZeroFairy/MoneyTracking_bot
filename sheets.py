@@ -126,6 +126,7 @@ FIELD_COLS = {
     "paid_by":    5,
     "shared":     6,
     "per_person": 7,
+    "category":   CATEGORY_COL,
 }
 
 
