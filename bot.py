@@ -120,6 +120,9 @@ def _disp(row_num: int) -> int:
     return row_num - 1
 
 
+_known_chats_cache = set()  # avoids a state.json read on every command once a chat is seen
+
+
 def restricted(func):
     @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *a, **kw):
@@ -127,7 +130,9 @@ def restricted(func):
         if config.ALLOWED_CHAT_IDS and chat_id not in config.ALLOWED_CHAT_IDS:
             await update.message.reply_text("🔒 Sorry, this bot is private.")
             return ConversationHandler.END
-        state.mark_known_chat(chat_id)  # so the monthly new-sheet nudge knows who to message
+        if chat_id not in _known_chats_cache:
+            state.mark_known_chat(chat_id)  # so the monthly new-sheet nudge knows who to message
+            _known_chats_cache.add(chat_id)
         return await func(update, context, *a, **kw)
     return wrapper
 
@@ -514,7 +519,7 @@ async def edit_pick_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "per_person": row[6]  if len(row) > 6  else "?",
         "category":   row[10] if len(row) > 10 else "",
     }
-    current = field_values.get(field, "?") if len(row) > 6 else "?"
+    current = field_values.get(field, "?")
     await query.edit_message_text(
         f"✏️ Editing *{label}* for entry #{_disp(row_num)}\n"
         f"Current value: `{current}`\n\n"
@@ -538,7 +543,7 @@ async def edit_save_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save_value = format_price(parsed)
         except ValueError:
             await update.message.reply_text(
-                f"⚠️ Couldn't read that as a price. Try `25000`, `25.000`, or `25k`."
+                "⚠️ Couldn't read that as a price. Try `25000`, `25.000`, or `25k`."
             )
             return EDIT_VALUE
     elif field == "date":
@@ -874,9 +879,11 @@ def _build_solo_keyboard(row_num, status):
 
 def _build_people_keyboard(row_num, names, settled_set):
     kb = []
-    for name in names:
+    # Index into names, not the name itself — same 64-byte callback_data
+    # concern as the /split and /add payer buttons.
+    for i, name in enumerate(names):
         icon = "✅" if name in settled_set else "⏳"
-        kb.append([InlineKeyboardButton(f"{icon} {name}", callback_data=f"mkperson:{row_num}:{name}")])
+        kb.append([InlineKeyboardButton(f"{icon} {name}", callback_data=f"mkperson:{row_num}:{i}")])
     kb.append([
         InlineKeyboardButton("💾 Save", callback_data=f"mksave:{row_num}"),
         InlineKeyboardButton("🔙 Back", callback_data="mkback"),
@@ -979,10 +986,15 @@ async def mk_solo_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def mk_person_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query  = update.callback_query
-    parts  = query.data.split(":", 2)
+    query   = update.callback_query
+    parts   = query.data.split(":", 2)
     row_num = int(parts[1])
-    person  = parts[2]
+    names   = context.chat_data.get("mk_names", [])
+    try:
+        person = names[int(parts[2])]
+    except (ValueError, IndexError):
+        await query.answer("⚠️ That option expired — please run /markpaid again.")
+        return
     settled = context.chat_data.get("mk_settled", set())
     if person in settled:
         settled.discard(person)
@@ -991,8 +1003,7 @@ async def mk_person_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         settled.add(person)
         await query.answer(f"✅ {person} — settled")
     context.chat_data["mk_settled"] = settled
-    names = context.chat_data.get("mk_names", [])
-    kb    = _build_people_keyboard(row_num, names, settled)
+    kb = _build_people_keyboard(row_num, names, settled)
     await query.edit_message_reply_markup(reply_markup=kb)
 
 
@@ -1347,7 +1358,10 @@ async def add_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ADD_PRICE
     context.chat_data["draft"]["price"] = price
     sender = update.effective_user.first_name
-    kb = [[InlineKeyboardButton(f"Me ({sender})", callback_data=f"paidby:{sender}")]]
+    # A fixed short token, not the name itself — Telegram first names can run
+    # up to 64 chars, which combined with a prefix risks the 64-byte
+    # callback_data cap. The actual name is re-read from the click itself.
+    kb = [[InlineKeyboardButton(f"Me ({sender})", callback_data="paidby:me")]]
     await update.message.reply_text("🙋 Who paid?", reply_markup=InlineKeyboardMarkup(kb))
     return ADD_PAID_BY
 
@@ -1355,7 +1369,7 @@ async def add_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def add_paid_by_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    name  = query.data.split(":", 1)[1]
+    name  = query.from_user.first_name
     context.chat_data["draft"]["paid_by"] = name
     await query.edit_message_text(
         f"Paid by: {name}\n\n🏷️ Pick a category:",
@@ -1528,12 +1542,15 @@ async def _split_ask_payer(update, context):
     if members:
         kb = []
         row = []
-        for m in members:
-            row.append(InlineKeyboardButton(m, callback_data=f"payer:{m}"))
+        # Index into the members list, not the name itself — member names
+        # come from free-text /setmembers with no length cap, so embedding
+        # one directly risks the 64-byte callback_data limit.
+        for i, m in enumerate(members):
+            row.append(InlineKeyboardButton(m, callback_data=f"payer:{i}"))
             if len(row) == 2:
                 kb.append(row); row = []
         if row: kb.append(row)
-        kb.append([InlineKeyboardButton("✍️ Type manually...", callback_data="payer:__manual__")])
+        kb.append([InlineKeyboardButton("✍️ Type manually...", callback_data="payer:manual")])
         msg_text = "Who paid the bill overall?"
         if hasattr(update, 'callback_query') and update.callback_query:
             await update.callback_query.message.reply_text(msg_text, reply_markup=InlineKeyboardMarkup(kb))
@@ -1545,10 +1562,16 @@ async def _split_ask_payer(update, context):
 async def split_payer_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    payer = query.data.split(":", 1)[1]
-    if payer == "__manual__":
+    token = query.data.split(":", 1)[1]
+    if token == "manual":
         await query.edit_message_text("Type the name of who paid:")
         return SPLIT_PAYER
+    members = state.get_members(update.effective_chat.id)
+    try:
+        payer = members[int(token)]
+    except (ValueError, IndexError):
+        await query.edit_message_text("⚠️ That option expired — please run /split again.")
+        return ConversationHandler.END
     context.chat_data["split"]["payer"] = payer
     await query.edit_message_text(
         f"Paid by: {payer}\n\nSend each item as:\n`Item | Price | Names`\nExample: `Nasi Goreng | 25000 | Andi, Budi`\n\nType /done when finished.",
@@ -1713,12 +1736,14 @@ async def even_names(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if members:
         kb = []
         row = []
-        for m in members:
-            row.append(InlineKeyboardButton(m, callback_data=f"evenpayer:{m}"))
+        # Index into the members list, not the name itself — same
+        # 64-byte callback_data concern as the /split payer buttons above.
+        for i, m in enumerate(members):
+            row.append(InlineKeyboardButton(m, callback_data=f"evenpayer:{i}"))
             if len(row) == 2:
                 kb.append(row); row = []
         if row: kb.append(row)
-        kb.append([InlineKeyboardButton("✍️ Type manually...", callback_data="evenpayer:__manual__")])
+        kb.append([InlineKeyboardButton("✍️ Type manually...", callback_data="evenpayer:manual")])
         await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
     else:
         await update.message.reply_text(text)
@@ -1728,10 +1753,16 @@ async def even_names(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def even_payer_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    payer = query.data.split(":", 1)[1]
-    if payer == "__manual__":
+    token = query.data.split(":", 1)[1]
+    if token == "manual":
         await query.edit_message_text("Type the name of who paid:")
         return EVEN_PAYER
+    members = state.get_members(update.effective_chat.id)
+    try:
+        payer = members[int(token)]
+    except (ValueError, IndexError):
+        await query.edit_message_text("⚠️ That option expired — please run /split again.")
+        return ConversationHandler.END
     context.chat_data["even"]["payer"] = payer
     await query.edit_message_text(f"Paid by: {payer}\n\nWhat's the total amount?")
     return EVEN_TOTAL
