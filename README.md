@@ -16,8 +16,13 @@ sheet every month.
 | `/summary` | Calculate who owes whom — Smart (optimized) or Normal (straight), filterable by date |
 | `/totals` | Total spending per person, filterable by date |
 | `/overview` | Spending breakdown by category, filterable by date |
+| `/recap` | Quick snapshot: total entries, grand total, biggest expense, top category, and top spender |
+| `/budgets` | See all active budgets and current usage with progress bars |
+| `/setbudget` | Set a monthly spending cap per category or overall, with 80%/100% alerts |
+| `/sortsheet` (alias `/sort`) | Re-sort the active sheet chronologically by date & time |
 | `/list` | Browse all entries in the active sheet, paginated, numbered #1, #2, ... |
 | `/delete` | Delete an entry (tap from a paginated list) |
+| `/undo` | Remove the last entry quickly |
 | `/markpaid` | Mark an entry (or individual people on a split entry) as paid/unpaid |
 | `/getlink` (alias `/sheet`) | Get the spreadsheet link |
 | `/newevent` | Create a new sheet/tab for a trip or event, and switch to it |
