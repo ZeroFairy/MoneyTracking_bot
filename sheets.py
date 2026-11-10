@@ -4,6 +4,7 @@ from datetime import datetime
 import gspread
 
 from config import GOOGLE_CREDENTIALS_FILE, GOOGLE_SHEETS_ID
+from utils import now_wib, format_price, parse_price
 
 HEADERS = ["Date & Time", "Place", "Buying List", "Price", "Paid By", "Shared By", "Amount/Person", "Picture", "Status", "Settled By", "Category"]
 
@@ -26,7 +27,6 @@ def _spreadsheet():
 
 
 def current_month_sheet_name() -> str:
-    from utils import now_wib
     return now_wib().strftime("%b %Y")
 
 
@@ -56,9 +56,7 @@ def list_sheet_titles():
 
 def append_expense(sheet_name, place, item, price, paid_by, shared_by, amount_per_person, picture="-", status="⏳ Unpaid", category="", date_str=None):
     ws = get_or_create_worksheet(sheet_name)
-    from utils import now_wib
     ts = date_str if date_str else now_wib().strftime("%d-%m-%Y %H:%M")
-    from utils import format_price
     ws.append_row(
         [ts, place, item, format_price(price), paid_by, shared_by,
          format_price(amount_per_person) if amount_per_person is not None else "-",
@@ -128,6 +126,7 @@ FIELD_COLS = {
     "paid_by":    5,
     "shared":     6,
     "per_person": 7,
+    "category":   CATEGORY_COL,
 }
 
 
@@ -178,8 +177,16 @@ def sort_by_date(sheet_name: str) -> int:
     data_rows.sort(key=_sort_key)  # stable: ties/malformed keep original order
 
     last_col = chr(ord("A") + width - 1)
-    end_row = 1 + len(data_rows)
+    end_row  = 1 + len(data_rows)
+    original_last_row = len(all_vals)  # includes header, 1-indexed
     ws.update(f"A2:{last_col}{end_row}", data_rows, value_input_option="USER_ENTERED")
+
+    # If any fully-blank rows got filtered out above, the sorted block is now
+    # shorter than the sheet's original data range — clear what's left beyond
+    # it, or it would sit there as stale, duplicated content.
+    if end_row < original_last_row:
+        ws.batch_clear([f"A{end_row + 1}:{last_col}{original_last_row}"])
+
     return len(data_rows)
 
 
@@ -197,7 +204,6 @@ def spreadsheet_url():
 def get_settlement_summary(sheet_name: str, start_date_str=None, end_date_str=None):
     ws = get_or_create_worksheet(sheet_name)
     data = ws.get_all_values()[1:]
-    from utils import parse_price, format_price
 
     start_date = None
     end_date = None
@@ -265,7 +271,6 @@ def get_settlement_summary(sheet_name: str, start_date_str=None, end_date_str=No
 def get_raw_summary(sheet_name: str, start_date_str=None, end_date_str=None):
     ws = get_or_create_worksheet(sheet_name)
     data = ws.get_all_values()[1:]
-    from utils import parse_price, format_price
 
     start_date = None
     end_date = None
@@ -309,7 +314,6 @@ def get_raw_summary(sheet_name: str, start_date_str=None, end_date_str=None):
         except ValueError:
             continue
 
-    from utils import format_price
     return [
         f"💸 *{d}* pays *{c}*: {format_price(a)}"
         for (d, c), a in direct_debts.items() if a > 10.0
@@ -323,8 +327,6 @@ def get_person_totals(sheet_name: str, start_date_str=None, end_date_str=None):
     """
     ws = get_or_create_worksheet(sheet_name)
     data = ws.get_all_values()[1:]
-    from utils import parse_price
-    from datetime import datetime
 
     start_date = end_date = None
     if start_date_str:
@@ -366,8 +368,6 @@ def get_category_overview(sheet_name: str, start_date_str=None, end_date_str=Non
     """
     ws = get_or_create_worksheet(sheet_name)
     data = ws.get_all_values()[1:]
-    from utils import parse_price
-    from datetime import datetime
 
     start_date = end_date = None
     if start_date_str:
@@ -418,7 +418,6 @@ def get_recap(sheet_name: str) -> dict:
     """
     ws = get_or_create_worksheet(sheet_name)
     data = ws.get_all_values()[1:]
-    from utils import parse_price
 
     count = 0
     grand_total = 0.0

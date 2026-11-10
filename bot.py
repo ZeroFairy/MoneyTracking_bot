@@ -51,6 +51,39 @@ PRESET_CATEGORIES = [
     ("📦 Other",             "Other"),
 ]
 
+# Short-tag aliases so /q's #tag lines up with the exact preset names used by
+# /add's category buttons (matters for /overview and /budgets, which group
+# and match categories by exact, case-insensitive name — "Food Drink" typed
+# via /q would otherwise show up as a separate category from "Food & Drink"
+# picked via /add's buttons).
+_CATEGORY_ALIASES = {
+    "food":             "Food & Drink",
+    "fooddrink":        "Food & Drink",
+    "drink":            "Food & Drink",
+    "transport":        "Transport",
+    "transportation":   "Transport",
+    "shopping":         "Shopping",
+    "household":        "Household",
+    "health":           "Health",
+    "entertainment":    "Entertainment",
+    "bills":            "Bills & Utilities",
+    "billsutilities":   "Bills & Utilities",
+    "utilities":        "Bills & Utilities",
+    "other":            "Other",
+}
+
+
+def _normalize_category(raw: str) -> str:
+    """Snaps a typed category (e.g. /q's #tag, or a typed custom category) to
+    the exact preset name if it's a recognizable match, so it stays consistent
+    with categories picked via /add's buttons. Falls back to the text as
+    typed (with underscores turned into spaces) if nothing matches.
+    """
+    if not raw:
+        return raw
+    key = raw.lower().replace("_", "").replace("&", "").replace(" ", "").replace("-", "")
+    return _CATEGORY_ALIASES.get(key, raw.replace("_", " ").strip())
+
 
 def _category_keyboard(callback_prefix: str = "cat"):
     """Inline keyboard with preset category buttons + custom option."""
@@ -70,30 +103,44 @@ HELP_TEXT = (
     "👋 *Expense Tracker Bot*\n\n"
     "⚡ *Quick add:*\n"
     "`/q Place Item Price`\n"
-    "e.g. `/q Indomaret Aqua 5000`\n\n"
-    "📋 *All commands:*\n"
-    "/add — log an expense (step-by-step)\n"
-    "/q — quick add a solo expense in one line\n"
-    "/split — split a group bill\n"
+    "e.g. `/q Indomaret Aqua 5000`\n"
+    "_(run `/q` alone for the full syntax & examples)_\n\n"
+
+    "📝 *Logging expenses*\n"
+    "/add — step-by-step, for splitting or backdating\n"
+    "/q — one-line quick add _(run alone for full syntax)_\n"
+    "/split — split a group bill\n\n"
+
+    "✏️ *Managing entries*\n"
+    "/list — browse all entries\n"
     "/edit — edit an existing entry\n"
+    "/delete — delete an entry\n"
+    "/undo — quickly delete the most recent entry\n"
+    "/markpaid — mark entries paid/unpaid, or per-person\n\n"
+
+    "📊 *Reviewing spending*\n"
     "/summary — calculate who owes whom\n"
     "/totals — total spending per person\n"
     "/overview — spending breakdown by category\n"
-    "/list — browse all entries\n"
-    "/delete — delete an entry\n"
-    "/undo — quickly delete the most recent entry\n"
-    "/markpaid — mark entries paid/unpaid or per-person\n"
-    "/getlink — get the spreadsheet link\n"
-    "/recap — quick snapshot: entries, grand total, biggest expense, top spender\n"
-    "/setbudget Category Amount — set a monthly cap per category, with 80%/100% alerts\n"
-    "/budgets — see all budgets and current usage\n"
-    "/sortsheet — re-sort the active sheet by date & time\n"
+    "/recap — quick snapshot: entries, grand total, biggest expense, top spender\n\n"
+
+    "💰 *Budgets*\n"
+    "/setbudget — set a monthly cap per category or overall, with 80%/100% alerts "
+    "_(run alone for full syntax)_\n"
+    "/budgets — see all budgets and current usage\n\n"
+
+    "🗂️ *Sheets & trips*\n"
     "/newevent — create a new sheet for a trip/event\n"
     "/switch — switch between sheets\n"
+    "/sortsheet — re-sort the active sheet by date & time\n"
+    "/getlink — get the spreadsheet link\n\n"
+
+    "👥 *Setup*\n"
     "/setmembers — save group names for quick-select\n"
-    "/setreminder HH:MM Message — add a daily reminder at that time\n"
+    "/setreminder — add a daily reminder _(run alone for full syntax)_\n"
     "/listreminders — show all your reminders\n"
-    "/stopreminder — remove a reminder\n"
+    "/stopreminder — remove a reminder\n\n"
+
     "/cancel — cancel the current action\n\n"
     "💡 Prices: `25000`, `25.000`, or `25k` all work.\n"
     "💡 `/q` logs you as the payer and sole sharer. Use /add if others are sharing."
@@ -120,6 +167,9 @@ def _disp(row_num: int) -> int:
     return row_num - 1
 
 
+_known_chats_cache = set()  # avoids a state.json read on every command once a chat is seen
+
+
 def restricted(func):
     @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *a, **kw):
@@ -127,7 +177,9 @@ def restricted(func):
         if config.ALLOWED_CHAT_IDS and chat_id not in config.ALLOWED_CHAT_IDS:
             await update.message.reply_text("🔒 Sorry, this bot is private.")
             return ConversationHandler.END
-        state.mark_known_chat(chat_id)  # so the monthly new-sheet nudge knows who to message
+        if chat_id not in _known_chats_cache:
+            state.mark_known_chat(chat_id)  # so the monthly new-sheet nudge knows who to message
+            _known_chats_cache.add(chat_id)
         return await func(update, context, *a, **kw)
     return wrapper
 
@@ -220,6 +272,10 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+_QUICKADD_CATEGORY_LINE = "• Categories: " + ", ".join(
+    f"#{value.lower().replace(' & ', '').replace(' ', '')}" for _, value in PRESET_CATEGORIES
+) + " (or any custom word)\n"
+
 QUICKADD_USAGE = (
     "⚡ *Quick Add usage:*\n"
     "`/q Place Item Price`\n"
@@ -239,6 +295,8 @@ QUICKADD_USAGE = (
     "• First word = place, last word = price, everything in between = item\n"
     "• Place or item has more than one word? Use `Place ; Item ; Price` instead\n"
     "• Add `#tag` at the end to set a category (optional)\n"
+    + _QUICKADD_CATEGORY_LINE +
+    "  _(these line up with the same categories /add uses, so /overview and /budgets stay consistent)_\n"
     "• Add `@date` at the end for a backdated entry — `@today`, `@yesterday`, "
     "`@DD-MM-YYYY`, or just `@HH:MM` for today at that time (optional, defaults to right now)\n"
     "• Need both a specific date AND time? Add both as separate tags, date first: "
@@ -287,7 +345,7 @@ async def quickadd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Then a trailing #category tag.
     category = ""
     if tokens[-1].startswith("#"):
-        category = tokens[-1][1:].replace("_", " ").strip()
+        category = _normalize_category(tokens[-1][1:].strip())
         tokens = tokens[:-1]
         if not tokens:
             await update.message.reply_text(
@@ -488,8 +546,20 @@ async def edit_pick_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return EDIT_FIELD
 
 
+EDIT_HINTS = {
+    "date":       " (e.g. `25-06-2026`, `25-06-2026 14:30`, `today`, `yesterday`)",
+    "place":      " (e.g. `Indomaret`)",
+    "item":       " (e.g. `Aqua Botol`)",
+    "price":      " (e.g. `25000`, `25.000`, or `25k`)",
+    "paid_by":    " (a name, e.g. `Andi`)",
+    "shared":     " (comma-separated names, e.g. `Andi, Budi`)",
+    "per_person": " (e.g. `12500` or `12.5k`)",
+    "category":   "",  # category uses button picker instead of a typed hint
+}
+
+
 async def edit_pick_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User picked a field — ask for the new value."""
+    """User picked a field — ask for the new value (or, for category, show a picker)."""
     query   = update.callback_query
     await query.answer()
     parts   = query.data.split(":", 2)   # editfield:ROWNUM:FIELDKEY
@@ -497,12 +567,7 @@ async def edit_pick_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     field   = parts[2]
     label, _, needs_price = EDIT_FIELDS[field]
     context.chat_data["edit_field"] = field
-    if needs_price:
-        hint = " (e.g. 25000 or 25k)"
-    elif field == "date":
-        hint = " (e.g. 25-06-2026 or 25-06-2026 14:30, or `today` / `yesterday`)"
-    else:
-        hint = ""
+
     row     = context.chat_data.get("edit_row", [])
     field_values = {
         "date":       row[0]  if len(row) > 0  else "?",
@@ -514,7 +579,22 @@ async def edit_pick_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "per_person": row[6]  if len(row) > 6  else "?",
         "category":   row[10] if len(row) > 10 else "",
     }
-    current = field_values.get(field, "?") if len(row) > 6 else "?"
+    current = field_values.get(field, "?")
+
+    if field == "category":
+        # Show the same preset buttons /add uses, instead of asking to type
+        # free text — avoids typos and category-name mismatches with /overview
+        # and /budgets, which match category names exactly (case-insensitive).
+        await query.edit_message_text(
+            f"✏️ Editing *{label}* for entry #{_disp(row_num)}\n"
+            f"Current value: `{current or '(none)'}`\n\n"
+            f"Pick a category, or type your own:",
+            parse_mode="Markdown",
+            reply_markup=_category_keyboard("editcat"),
+        )
+        return EDIT_VALUE
+
+    hint = EDIT_HINTS.get(field, "")
     await query.edit_message_text(
         f"✏️ Editing *{label}* for entry #{_disp(row_num)}\n"
         f"Current value: `{current}`\n\n"
@@ -524,12 +604,55 @@ async def edit_pick_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return EDIT_VALUE
 
 
+async def edit_category_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles a preset category button tap while editing the category field."""
+    query = update.callback_query
+    await query.answer()
+    value = query.data.split(":", 1)[1]
+    if value == "__custom__":
+        await query.edit_message_text("✍️ Type your custom category:")
+        return EDIT_VALUE
+
+    async def _send(text, **kw):
+        await query.edit_message_text(text, **kw)
+
+    return await _finish_edit(context, _send, value)
+
+
+async def _finish_edit(context: ContextTypes.DEFAULT_TYPE, send, save_value: str):
+    """Shared save + cleanup for /edit, used by both the typed-value path and
+    the category button path. `send(text, **kwargs)` delivers the result back
+    to the user regardless of which path triggered it. Wrapped in try/except
+    so an unexpected error can't strand the /edit conversation the way an
+    unhandled exception here previously did (e.g. a field with no column
+    mapping in sheets.py).
+    """
+    field   = context.chat_data.get("edit_field", "")
+    row_num = context.chat_data.get("edit_row_num")
+    name    = context.chat_data.get("edit_sheet", "")
+    label   = EDIT_FIELDS.get(field, ("that field",))[0]
+
+    for k in ("edit_sheet", "edit_rows", "edit_page", "edit_row_num", "edit_row", "edit_field"):
+        context.chat_data.pop(k, None)
+
+    try:
+        sheets.update_expense_field(name, row_num, field, save_value)
+    except Exception:
+        logger.exception(f"Failed to save /edit for field={field!r}")
+        await send("❌ Something went wrong saving that — please run /edit again.")
+        return ConversationHandler.END
+
+    await send(
+        f"✅ *Updated!*\n{label} → `{save_value}`\n_(entry #{_disp(row_num)} in {name})_",
+        parse_mode="Markdown",
+    )
+    return ConversationHandler.END
+
+
 async def edit_save_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """User typed a new value — validate and save."""
     raw_value = update.message.text.strip()
     field     = context.chat_data.get("edit_field", "")
-    row_num   = context.chat_data.get("edit_row_num")
-    name      = context.chat_data.get("edit_sheet", "")
     label, _, needs_price = EDIT_FIELDS[field]
 
     if needs_price:
@@ -538,7 +661,7 @@ async def edit_save_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save_value = format_price(parsed)
         except ValueError:
             await update.message.reply_text(
-                f"⚠️ Couldn't read that as a price. Try `25000`, `25.000`, or `25k`."
+                "⚠️ Couldn't read that as a price. Try `25000`, `25.000`, or `25k`."
             )
             return EDIT_VALUE
     elif field == "date":
@@ -552,17 +675,10 @@ async def edit_save_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         save_value = raw_value
 
-    sheets.update_expense_field(name, row_num, field, save_value)
+    async def _send(text, **kw):
+        await update.message.reply_text(text, **kw)
 
-    # Clean up
-    for k in ("edit_sheet", "edit_rows", "edit_page", "edit_row_num", "edit_row", "edit_field"):
-        context.chat_data.pop(k, None)
-
-    await update.message.reply_text(
-        f"✅ *Updated!*\n{label} → `{save_value}`\n_(entry #{_disp(row_num)} in {name})_",
-        parse_mode="Markdown",
-    )
-    return ConversationHandler.END
+    return await _finish_edit(context, _send, save_value)
 
 
 async def edit_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -874,9 +990,11 @@ def _build_solo_keyboard(row_num, status):
 
 def _build_people_keyboard(row_num, names, settled_set):
     kb = []
-    for name in names:
+    # Index into names, not the name itself — same 64-byte callback_data
+    # concern as the /split and /add payer buttons.
+    for i, name in enumerate(names):
         icon = "✅" if name in settled_set else "⏳"
-        kb.append([InlineKeyboardButton(f"{icon} {name}", callback_data=f"mkperson:{row_num}:{name}")])
+        kb.append([InlineKeyboardButton(f"{icon} {name}", callback_data=f"mkperson:{row_num}:{i}")])
     kb.append([
         InlineKeyboardButton("💾 Save", callback_data=f"mksave:{row_num}"),
         InlineKeyboardButton("🔙 Back", callback_data="mkback"),
@@ -979,10 +1097,15 @@ async def mk_solo_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def mk_person_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query  = update.callback_query
-    parts  = query.data.split(":", 2)
+    query   = update.callback_query
+    parts   = query.data.split(":", 2)
     row_num = int(parts[1])
-    person  = parts[2]
+    names   = context.chat_data.get("mk_names", [])
+    try:
+        person = names[int(parts[2])]
+    except (ValueError, IndexError):
+        await query.answer("⚠️ That option expired — please run /markpaid again.")
+        return
     settled = context.chat_data.get("mk_settled", set())
     if person in settled:
         settled.discard(person)
@@ -991,8 +1114,7 @@ async def mk_person_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         settled.add(person)
         await query.answer(f"✅ {person} — settled")
     context.chat_data["mk_settled"] = settled
-    names = context.chat_data.get("mk_names", [])
-    kb    = _build_people_keyboard(row_num, names, settled)
+    kb = _build_people_keyboard(row_num, names, settled)
     await query.edit_message_reply_markup(reply_markup=kb)
 
 
@@ -1347,7 +1469,10 @@ async def add_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ADD_PRICE
     context.chat_data["draft"]["price"] = price
     sender = update.effective_user.first_name
-    kb = [[InlineKeyboardButton(f"Me ({sender})", callback_data=f"paidby:{sender}")]]
+    # A fixed short token, not the name itself — Telegram first names can run
+    # up to 64 chars, which combined with a prefix risks the 64-byte
+    # callback_data cap. The actual name is re-read from the click itself.
+    kb = [[InlineKeyboardButton(f"Me ({sender})", callback_data="paidby:me")]]
     await update.message.reply_text("🙋 Who paid?", reply_markup=InlineKeyboardMarkup(kb))
     return ADD_PAID_BY
 
@@ -1355,7 +1480,7 @@ async def add_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def add_paid_by_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    name  = query.data.split(":", 1)[1]
+    name  = query.from_user.first_name
     context.chat_data["draft"]["paid_by"] = name
     await query.edit_message_text(
         f"Paid by: {name}\n\n🏷️ Pick a category:",
@@ -1528,12 +1653,15 @@ async def _split_ask_payer(update, context):
     if members:
         kb = []
         row = []
-        for m in members:
-            row.append(InlineKeyboardButton(m, callback_data=f"payer:{m}"))
+        # Index into the members list, not the name itself — member names
+        # come from free-text /setmembers with no length cap, so embedding
+        # one directly risks the 64-byte callback_data limit.
+        for i, m in enumerate(members):
+            row.append(InlineKeyboardButton(m, callback_data=f"payer:{i}"))
             if len(row) == 2:
                 kb.append(row); row = []
         if row: kb.append(row)
-        kb.append([InlineKeyboardButton("✍️ Type manually...", callback_data="payer:__manual__")])
+        kb.append([InlineKeyboardButton("✍️ Type manually...", callback_data="payer:manual")])
         msg_text = "Who paid the bill overall?"
         if hasattr(update, 'callback_query') and update.callback_query:
             await update.callback_query.message.reply_text(msg_text, reply_markup=InlineKeyboardMarkup(kb))
@@ -1545,10 +1673,16 @@ async def _split_ask_payer(update, context):
 async def split_payer_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    payer = query.data.split(":", 1)[1]
-    if payer == "__manual__":
+    token = query.data.split(":", 1)[1]
+    if token == "manual":
         await query.edit_message_text("Type the name of who paid:")
         return SPLIT_PAYER
+    members = state.get_members(update.effective_chat.id)
+    try:
+        payer = members[int(token)]
+    except (ValueError, IndexError):
+        await query.edit_message_text("⚠️ That option expired — please run /split again.")
+        return ConversationHandler.END
     context.chat_data["split"]["payer"] = payer
     await query.edit_message_text(
         f"Paid by: {payer}\n\nSend each item as:\n`Item | Price | Names`\nExample: `Nasi Goreng | 25000 | Andi, Budi`\n\nType /done when finished.",
@@ -1713,12 +1847,14 @@ async def even_names(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if members:
         kb = []
         row = []
-        for m in members:
-            row.append(InlineKeyboardButton(m, callback_data=f"evenpayer:{m}"))
+        # Index into the members list, not the name itself — same
+        # 64-byte callback_data concern as the /split payer buttons above.
+        for i, m in enumerate(members):
+            row.append(InlineKeyboardButton(m, callback_data=f"evenpayer:{i}"))
             if len(row) == 2:
                 kb.append(row); row = []
         if row: kb.append(row)
-        kb.append([InlineKeyboardButton("✍️ Type manually...", callback_data="evenpayer:__manual__")])
+        kb.append([InlineKeyboardButton("✍️ Type manually...", callback_data="evenpayer:manual")])
         await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
     else:
         await update.message.reply_text(text)
@@ -1728,10 +1864,16 @@ async def even_names(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def even_payer_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    payer = query.data.split(":", 1)[1]
-    if payer == "__manual__":
+    token = query.data.split(":", 1)[1]
+    if token == "manual":
         await query.edit_message_text("Type the name of who paid:")
         return EVEN_PAYER
+    members = state.get_members(update.effective_chat.id)
+    try:
+        payer = members[int(token)]
+    except (ValueError, IndexError):
+        await query.edit_message_text("⚠️ That option expired — please run /split again.")
+        return ConversationHandler.END
     context.chat_data["even"]["payer"] = payer
     await query.edit_message_text(f"Paid by: {payer}\n\nWhat's the total amount?")
     return EVEN_TOTAL
@@ -2406,6 +2548,7 @@ def main():
                 CallbackQueryHandler(edit_cancel,     pattern=r"^editcancel$"),
             ],
             EDIT_VALUE: [
+                CallbackQueryHandler(edit_category_button, pattern=r"^editcat:"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, edit_save_value),
             ],
         },
