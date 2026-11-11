@@ -1542,7 +1542,7 @@ async def add_place(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def add_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data["draft"]["item"] = update.message.text.strip()
-    await update.message.reply_text("💰 How much? (e.g. 25000 or 25k)")
+    await update.message.reply_text("💰 How much? (e.g. 25000, 25k, or 0 if it's free)")
     return ADD_PRICE
 
 
@@ -1551,9 +1551,6 @@ async def add_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
         price = parse_price(update.message.text)
     except ValueError:
         await update.message.reply_text("Couldn't read that price, try again e.g. 25000 or 25k")
-        return ADD_PRICE
-    if price <= 0:
-        await update.message.reply_text("The price must be greater than 0 — try again.")
         return ADD_PRICE
     context.chat_data["draft"]["price"] = price
     sender = update.effective_user.first_name
