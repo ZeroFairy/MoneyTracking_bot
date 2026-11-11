@@ -1,172 +1,207 @@
-"""Tiny JSON-file-backed state."""
+"""State management using Google Sheets internal tabs instead of state.json."""
 import json
-import os
-import uuid
+import gspread
+from config import GOOGLE_CREDENTIALS_FILE, GOOGLE_SHEETS_ID
 
-STATE_FILE = os.path.join(os.path.dirname(__file__), "state.json")
+STATE_PREFIX = "BotState_"
 
+_gc = None
+_sh = None
 
-def _load() -> dict:
-    if not os.path.exists(STATE_FILE):
-        return {}
-    with open(STATE_FILE, "r", encoding="utf-8") as f:
-        try:
-            return json.load(f)
-        except json.JSONDecodeError:
-            return {}
+def _client():
+    global _gc
+    if _gc is None:
+        _gc = gspread.service_account(filename=GOOGLE_CREDENTIALS_FILE)
+    return _gc
 
+def _spreadsheet():
+    global _sh
+    if _sh is None:
+        _sh = _client().open_by_key(GOOGLE_SHEETS_ID)
+    return _sh
 
-def _save(data: dict) -> None:
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+def _get_or_create_state_sheet(name: str):
+    sh = _spreadsheet()
+    title = STATE_PREFIX + name
+    try:
+        ws = sh.worksheet(title)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=title, rows=100, cols=2)
+        ws.append_row(["Key", "Value"])
+    return ws
 
+# ---------------------------------------------------------------------------
+# Active Sheet per Chat
+# ---------------------------------------------------------------------------
+def get_active_sheet(chat_id: int) -> str:
+    ws = _get_or_create_state_sheet("ActiveSheets")
+    records = ws.get_all_records()
+    for r in records:
+        if str(r.get("Key")) == str(chat_id):
+            return str(r.get("Value", ""))
+    return ""
 
-# ── Active sheet ──────────────────────────────────────────────────────────────
-
-def get_active_sheet(chat_id: int):
-    return _load().get(str(chat_id))
-
-
-def set_active_sheet(chat_id: int, name) -> None:
-    data = _load()
-    if name is None:
-        data.pop(str(chat_id), None)
+def set_active_sheet(chat_id: int, sheet_name: str):
+    ws = _get_or_create_state_sheet("ActiveSheets")
+    cell = ws.find(str(chat_id))
+    if cell:
+        ws.update_cell(cell.row, 2, sheet_name)
     else:
-        data[str(chat_id)] = name
-    _save(data)
+        ws.append_row([str(chat_id), sheet_name])
 
+# ---------------------------------------------------------------------------
+# Known Chats (for monthly new-sheet nudge)
+# ---------------------------------------------------------------------------
+def get_known_chats() -> set:
+    ws = _get_or_create_state_sheet("KnownChats")
+    records = ws.get_all_records()
+    return {int(r["Key"]) for r in records if str(r.get("Key", "")).lstrip("-").isdigit()}
 
-# ── Members ───────────────────────────────────────────────────────────────────
+def mark_known_chat(chat_id: int):
+    chats = get_known_chats()
+    if chat_id not in chats:
+        ws = _get_or_create_state_sheet("KnownChats")
+        ws.append_row([str(chat_id), "True"])
 
-def get_members(chat_id: int):
-    return _load().get(f"members_{chat_id}", [])
+# ---------------------------------------------------------------------------
+# Members per Chat
+# ---------------------------------------------------------------------------
+def get_members(chat_id: int) -> list:
+    ws = _get_or_create_state_sheet("Members")
+    records = ws.get_all_records()
+    for r in records:
+        if str(r.get("Key")) == str(chat_id):
+            val = r.get("Value", "[]")
+            try:
+                return json.loads(val)
+            except Exception:
+                return []
+    return []
 
+def set_members(chat_id: int, members: list):
+    ws = _get_or_create_state_sheet("Members")
+    val_str = json.dumps(members)
+    cell = ws.find(str(chat_id))
+    if cell:
+        ws.update_cell(cell.row, 2, val_str)
+    else:
+        ws.append_row([str(chat_id), val_str])
 
-def set_members(chat_id: int, members: list) -> None:
-    data = _load()
-    data[f"members_{chat_id}"] = members
-    _save(data)
-
-
-# ── Reminders (multiple per chat) ─────────────────────────────────────────────
-# Stored as: "reminders_{chat_id}": [{"id": str, "hour": int, "minute": int, "message": str}, ...]
-
+# ---------------------------------------------------------------------------
+# Reminders per Chat
+# ---------------------------------------------------------------------------
 def get_reminders(chat_id: int) -> list:
-    """Returns list of reminder dicts for this chat."""
-    return _load().get(f"reminders_{chat_id}", [])
-
-
-def add_reminder(chat_id: int, hour_utc: int, minute: int, message: str) -> str:
-    """Adds a new reminder. Returns the generated reminder ID."""
-    data = _load()
-    key  = f"reminders_{chat_id}"
-    reminders = data.get(key, [])
-    rid = uuid.uuid4().hex[:8]  # short unique ID e.g. "a3f9c12b"
-    reminders.append({"id": rid, "hour": hour_utc, "minute": minute, "message": message})
-    data[key] = reminders
-    _save(data)
-    return rid
-
-
-def delete_reminder(chat_id: int, reminder_id: str) -> bool:
-    """Removes a reminder by ID. Returns True if found and removed."""
-    data = _load()
-    key  = f"reminders_{chat_id}"
-    before = data.get(key, [])
-    after  = [r for r in before if r["id"] != reminder_id]
-    if len(after) == len(before):
-        return False
-    data[key] = after
-    _save(data)
-    return True
-
-
-def delete_all_reminders(chat_id: int) -> None:
-    data = _load()
-    data.pop(f"reminders_{chat_id}", None)
-    _save(data)
-
+    ws = _get_or_create_state_sheet("Reminders")
+    records = ws.get_all_records()
+    for r in records:
+        if str(r.get("Key")) == str(chat_id):
+            val = r.get("Value", "[]")
+            try:
+                return json.loads(val)
+            except Exception:
+                return []
+    return []
 
 def get_all_reminders() -> dict:
-    """Returns {chat_id (int): [list of reminder dicts]} for all chats."""
-    data   = _load()
-    result = {}
-    for key, val in data.items():
-        if key.startswith("reminders_") and isinstance(val, list):
+    """Returns {chat_id: [reminder_dicts, ...]} for all chats."""
+    ws = _get_or_create_state_sheet("Reminders")
+    records = ws.get_all_records()
+    out = {}
+    for r in records:
+        key_str = str(r.get("Key", ""))
+        val_str = r.get("Value", "[]")
+        if key_str.lstrip("-").isdigit():
+            chat_id = int(key_str)
             try:
-                chat_id = int(key.replace("reminders_", ""))
-                result[chat_id] = val
-            except ValueError:
-                pass
-    return result
+                out[chat_id] = json.loads(val_str)
+            except Exception:
+                out[chat_id] = []
+    return out
 
+def add_reminder(chat_id: int, hour: int, minute: int, message: str) -> str:
+    import uuid
+    reminders = get_reminders(chat_id)
+    rid = uuid.uuid4().hex[:8]
+    reminders.append({"id": rid, "hour": hour, "minute": minute, "message": message})
+    _save_reminders(chat_id, reminders)
+    return rid
 
-# ── Budgets (per chat, per category) ──────────────────────────────────────────
-# Stored as: "budgets_{chat_id}": {category: amount}
+def delete_reminder(chat_id: int, rid: str):
+    reminders = get_reminders(chat_id)
+    reminders = [r for r in reminders if r["id"] != rid]
+    _save_reminders(chat_id, reminders)
 
+def delete_all_reminders(chat_id: int):
+    _save_reminders(chat_id, [])
+
+def _save_reminders(chat_id: int, reminders: list):
+    ws = _get_or_create_state_sheet("Reminders")
+    val_str = json.dumps(reminders)
+    cell = ws.find(str(chat_id))
+    if cell:
+        ws.update_cell(cell.row, 2, val_str)
+    else:
+        ws.append_row([str(chat_id), val_str])
+
+# ---------------------------------------------------------------------------
+# Budgets & Total Budget per Chat
+# ---------------------------------------------------------------------------
 def get_budgets(chat_id: int) -> dict:
-    """Returns {category: amount} for this chat, or {} if none set."""
-    return _load().get(f"budgets_{chat_id}", {})
+    ws = _get_or_create_state_sheet("Budgets")
+    records = ws.get_all_records()
+    for r in records:
+        if str(r.get("Key")) == str(chat_id):
+            try:
+                return json.loads(r.get("Value", "{}"))
+            except Exception:
+                return {}
+    return {}
 
-
-def set_budget(chat_id: int, category: str, amount: float) -> None:
-    data    = _load()
-    key     = f"budgets_{chat_id}"
-    budgets = data.get(key, {})
+def set_budget(chat_id: int, category: str, amount: float):
+    budgets = get_budgets(chat_id)
     budgets[category] = amount
-    data[key] = budgets
-    _save(data)
-
+    _save_budgets(chat_id, budgets)
 
 def delete_budget(chat_id: int, category: str) -> bool:
-    """Removes a budget by exact category match. Returns True if it existed."""
-    data    = _load()
-    key     = f"budgets_{chat_id}"
-    budgets = data.get(key, {})
-    if category not in budgets:
-        return False
-    del budgets[category]
-    data[key] = budgets
-    _save(data)
-    return True
+    budgets = get_budgets(chat_id)
+    if category in budgets:
+        del budgets[category]
+        _save_budgets(chat_id, budgets)
+        return True
+    return False
 
+def _save_budgets(chat_id: int, budgets: dict):
+    ws = _get_or_create_state_sheet("Budgets")
+    val_str = json.dumps(budgets)
+    cell = ws.find(str(chat_id))
+    if cell:
+        ws.update_cell(cell.row, 2, val_str)
+    else:
+        ws.append_row([str(chat_id), val_str])
 
-# ── Overall budget (across ALL categories combined) ──────────────────────────
-# Stored separately from per-category budgets as: "budget_total_{chat_id}": amount
+def get_total_budget(chat_id: int) -> float:
+    ws = _get_or_create_state_sheet("TotalBudgets")
+    records = ws.get_all_records()
+    for r in records:
+        if str(r.get("Key")) == str(chat_id):
+            try:
+                return float(r.get("Value", 0))
+            except Exception:
+                return 0.0
+    return 0.0
 
-def get_total_budget(chat_id: int):
-    """Returns the overall budget amount for this chat, or None if not set."""
-    return _load().get(f"budget_total_{chat_id}")
-
-
-def set_total_budget(chat_id: int, amount: float) -> None:
-    data = _load()
-    data[f"budget_total_{chat_id}"] = amount
-    _save(data)
-
+def set_total_budget(chat_id: int, amount: float):
+    ws = _get_or_create_state_sheet("TotalBudgets")
+    cell = ws.find(str(chat_id))
+    if cell:
+        ws.update_cell(cell.row, 2, str(amount))
+    else:
+        ws.append_row([str(chat_id), str(amount)])
 
 def delete_total_budget(chat_id: int) -> bool:
-    """Removes the overall budget. Returns True if it existed."""
-    data = _load()
-    key  = f"budget_total_{chat_id}"
-    if key not in data:
-        return False
-    del data[key]
-    _save(data)
-    return True
-
-
-# ── Known chats (so we can broadcast things like "new month started") ────────
-
-def mark_known_chat(chat_id: int) -> None:
-    """Records that this chat has used the bot at least once."""
-    data = _load()
-    known = set(data.get("known_chats", []))
-    if chat_id not in known:
-        known.add(chat_id)
-        data["known_chats"] = list(known)
-        _save(data)
-
-
-def get_known_chats() -> list:
-    return _load().get("known_chats", [])
+    ws = _get_or_create_state_sheet("TotalBudgets")
+    cell = ws.find(str(chat_id))
+    if cell:
+        ws.update_cell(cell.row, 2, "0")
+        return True
+    return False

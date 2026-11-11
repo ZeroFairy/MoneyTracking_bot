@@ -1,9 +1,12 @@
 """Telegram Expense Tracker Bot."""
-import logging
 import asyncio
+import logging
+import math
+import re
 from functools import wraps
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -17,7 +20,7 @@ from telegram.ext import (
 import config
 import sheets
 import state
-from utils import format_price, parse_price, parse_date_input, now_wib
+from utils import format_price, parse_price, parse_date_input, now_wib, md_escape, code_safe
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -107,7 +110,7 @@ HELP_TEXT = (
     "_(run `/q` alone for the full syntax & examples)_\n\n"
 
     "📝 *Logging expenses*\n"
-    "/add — step-by-step, for splitting or backdating\n"
+    "/add — step-by-step, with category & backdating\n"
     "/q — one-line quick add _(run alone for full syntax)_\n"
     "/split — split a group bill\n\n"
 
@@ -143,7 +146,7 @@ HELP_TEXT = (
 
     "/cancel — cancel the current action\n\n"
     "💡 Prices: `25000`, `25.000`, or `25k` all work.\n"
-    "💡 `/q` logs you as the payer and sole sharer. Use /add if others are sharing."
+    "💡 `/q` logs you as the payer and sole sharer. Use /split if others are sharing."
 )
 
 
@@ -175,11 +178,17 @@ def restricted(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *a, **kw):
         chat_id = update.effective_chat.id
         if config.ALLOWED_CHAT_IDS and chat_id not in config.ALLOWED_CHAT_IDS:
-            await update.message.reply_text("🔒 Sorry, this bot is private.")
+            msg = update.effective_message  # update.message is None for edited messages
+            if msg:
+                await msg.reply_text("🔒 Sorry, this bot is private.")
             return ConversationHandler.END
         if chat_id not in _known_chats_cache:
-            state.mark_known_chat(chat_id)  # so the monthly new-sheet nudge knows who to message
-            _known_chats_cache.add(chat_id)
+            try:
+                state.mark_known_chat(chat_id)  # so the monthly new-sheet nudge knows who to message
+                _known_chats_cache.add(chat_id)
+            except Exception:
+                # A Sheets hiccup here must not make every command fail; retried next time.
+                logger.warning("Could not record known chat %s", chat_id, exc_info=True)
         return await func(update, context, *a, **kw)
     return wrapper
 
@@ -215,24 +224,24 @@ async def recap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data    = sheets.get_recap(name)
 
     if data["count"] == 0:
-        await update.message.reply_text(f"No entries yet in *{name}*.", parse_mode="Markdown")
+        await update.message.reply_text(f"No entries yet in *{md_escape(name)}*.", parse_mode="Markdown")
         return
 
-    lines = [f"📊 *Recap — {name}*", ""]
+    lines = [f"📊 *Recap — {md_escape(name)}*", ""]
     lines.append(f"🧾 Entries: *{data['count']}*")
     lines.append(f"💰 Grand total: *{format_price(data['grand_total'])}*")
 
     if data["biggest_expense"]:
         price, place, item = data["biggest_expense"]
-        lines.append(f"🔥 Biggest expense: *{format_price(price)}* — {place} ({item})")
+        lines.append(f"🔥 Biggest expense: *{format_price(price)}* — {md_escape(place)} ({md_escape(item)})")
 
     if data["top_category"]:
         cat, total = data["top_category"]
-        lines.append(f"🏷️ Top category: *{cat}* ({format_price(total)})")
+        lines.append(f"🏷️ Top category: *{md_escape(cat)}* ({format_price(total)})")
 
     if data["top_spender"]:
         person, total = data["top_spender"]
-        lines.append(f"🙋 Biggest spender: *{person}* ({format_price(total)})")
+        lines.append(f"🙋 Biggest spender: *{md_escape(person)}* ({format_price(total)})")
 
     lines.append("\n_Want the full category breakdown? Use /overview._")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
@@ -247,7 +256,7 @@ async def sortsheet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     chat_id = update.effective_chat.id
     name    = active_sheet_name(chat_id)
-    await update.message.reply_text(f"🔄 Sorting *{name}* by date & time…", parse_mode="Markdown")
+    await update.message.reply_text(f"🔄 Sorting *{md_escape(name)}* by date & time…", parse_mode="Markdown")
     try:
         count = sheets.sort_by_date(name)
     except Exception:
@@ -258,7 +267,7 @@ async def sortsheet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Nothing to sort — the sheet is empty.")
         return
     await update.message.reply_text(
-        f"✅ Sorted *{count}* {'entry' if count == 1 else 'entries'} in *{name}* "
+        f"✅ Sorted *{count}* {'entry' if count == 1 else 'entries'} in *{md_escape(name)}* "
         f"chronologically (oldest → newest).\n\n"
         f"⚠️ Row numbers may have shifted — re-check /list, /edit, /delete or /markpaid "
         f"before using an entry number you noted earlier.",
@@ -302,7 +311,7 @@ QUICKADD_USAGE = (
     "• Need both a specific date AND time? Add both as separate tags, date first: "
     "`@25-06-2026 @14:30`\n"
     "• You are set as payer and sole sharer\n"
-    "• Use /add instead if others are sharing the cost"
+    "• Use /split instead if others are sharing the cost"
 )
 
 
@@ -316,43 +325,40 @@ async def quickadd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     tokens = raw[1].strip().split()
 
-    # Peel off ALL trailing @tags — supports one combined tag (@yesterday,
-    # @14:30, @25-06-2026) as well as a separate date + time given as two
-    # tags (@25-06-2026 @14:30), which are joined back into "25-06-2026 14:30"
-    # before parsing.
-    date_str = None
+    # Peel trailing @date and #category tags in ANY order ("... #food @yesterday"
+    # and "... @yesterday #food" both work). A date and a time may be two separate
+    # @tags ("@25-06-2026 @14:30"); they're joined back together before parsing.
     date_tags = []
-    while tokens and tokens[-1].startswith("@"):
-        date_tags.insert(0, tokens.pop()[1:].strip())
+    category = ""
+    while tokens and tokens[-1][:1] in ("@", "#"):
+        tok = tokens[-1]
+        if tok.startswith("@"):
+            date_tags.insert(0, tok[1:].strip())
+        elif category:
+            break  # a second #tag is treated as part of the item text
+        else:
+            category = _normalize_category(tok[1:].strip())
+        tokens.pop()
+
+    date_str = None
     if date_tags:
-        date_raw = " ".join(date_tags)
+        date_raw = " ".join(t for t in date_tags if t)
         try:
             date_str = parse_date_input(date_raw)
         except ValueError:
             await update.message.reply_text(
-                f"⚠️ Couldn't read `{date_raw}` as a date/time.\n"
+                f"⚠️ Couldn't read `{code_safe(date_raw)}` as a date/time.\n"
                 "Try `today`, `yesterday`, `25-06-2026`, `25-06-2026 14:30`, or just a time like `14:30`.",
                 parse_mode="Markdown",
             )
             return
-        if not tokens:
-            await update.message.reply_text(
-                "⚠️ Need at least *Place*, *Item*, *Price* before the @tag\n\n" + QUICKADD_USAGE,
-                parse_mode="Markdown",
-            )
-            return
 
-    # Then a trailing #category tag.
-    category = ""
-    if tokens[-1].startswith("#"):
-        category = _normalize_category(tokens[-1][1:].strip())
-        tokens = tokens[:-1]
-        if not tokens:
-            await update.message.reply_text(
-                "⚠️ Need at least *Place*, *Item*, *Price* before the #tag\n\n" + QUICKADD_USAGE,
-                parse_mode="Markdown",
-            )
-            return
+    if not tokens:
+        await update.message.reply_text(
+            "⚠️ Need at least *Place*, *Item*, *Price* before the tags\n\n" + QUICKADD_USAGE,
+            parse_mode="Markdown",
+        )
+        return
 
     remainder = " ".join(tokens)
 
@@ -385,24 +391,27 @@ async def quickadd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         price = parse_price(price_raw)
     except ValueError:
         await update.message.reply_text(
-            f"⚠️ Couldn't read `{price_raw}` as a price.\n"
+            f"⚠️ Couldn't read `{code_safe(price_raw)}` as a price.\n"
             "Try formats like `5000`, `5.000`, or `5k`.",
             parse_mode="Markdown",
         )
+        return
+    if price <= 0:
+        await update.message.reply_text("⚠️ The price must be greater than 0.")
         return
 
     sender     = update.effective_user.first_name
     chat_id    = update.effective_chat.id
     sheet_name = active_sheet_name(chat_id)
     sheets.append_expense(sheet_name, place, item, price, sender, sender, price, status="✅ Paid", category=category, date_str=date_str)
-    cat_line  = f"  🏷️ {category}" if category else ""
+    cat_line  = f"  🏷️ {md_escape(category)}" if category else ""
     date_line = f"\n📅 {date_str}" if date_str else ""
     warning = _budget_warnings(chat_id, sheet_name, category)
     await update.message.reply_text(
         f"⚡ *Saved!*\n"
-        f"📍 {place} — {item}\n"
-        f"💰 {format_price(price)}  |  🙋 {sender}{cat_line}\n"
-        f"📋 Sheet: {sheet_name}{date_line}"
+        f"📍 {md_escape(place)} — {md_escape(item)}\n"
+        f"💰 {format_price(price)}  |  🙋 {md_escape(sender)}{cat_line}\n"
+        f"📋 Sheet: {md_escape(sheet_name)}{date_line}"
         f"{warning}",
         parse_mode="Markdown",
     )
@@ -493,14 +502,14 @@ async def edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name     = active_sheet_name(chat_id)
     all_rows = sheets.get_all_expenses(name)
     if not all_rows:
-        await update.message.reply_text(f"No entries yet in *{name}*.", parse_mode="Markdown")
+        await update.message.reply_text(f"No entries yet in *{md_escape(name)}*.", parse_mode="Markdown")
         return ConversationHandler.END
     context.chat_data["edit_sheet"] = name
     context.chat_data["edit_rows"]  = all_rows
     context.chat_data["edit_page"]  = 0
     kb, total_pages = _edit_entry_keyboard(all_rows, 0)
     await update.message.reply_text(
-        f"✏️ *Edit an entry* — *{name}*\nPage 1/{total_pages}",
+        f"✏️ *Edit an entry* — *{md_escape(name)}*\nPage 1/{total_pages}",
         parse_mode="Markdown", reply_markup=kb,
     )
     return EDIT_PICK
@@ -512,13 +521,17 @@ async def edit_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
     page     = int(query.data.split(":")[1])
     all_rows = context.chat_data.get("edit_rows", [])
     name     = context.chat_data.get("edit_sheet", "")
+    if not name:
+        await query.edit_message_text("⚠️ That menu expired — please run /edit again.")
+        return ConversationHandler.END
     if not all_rows:
         all_rows = sheets.get_all_expenses(name)
         context.chat_data["edit_rows"] = all_rows
+    page = max(0, min(page, max(1, -(-len(all_rows) // EDIT_PAGE_SIZE)) - 1))
     context.chat_data["edit_page"] = page
     kb, total_pages = _edit_entry_keyboard(all_rows, page)
     await query.edit_message_text(
-        f"✏️ *Edit an entry* — *{name}*\nPage {page + 1}/{total_pages}",
+        f"✏️ *Edit an entry* — *{md_escape(name)}*\nPage {page + 1}/{total_pages}",
         parse_mode="Markdown", reply_markup=kb,
     )
     return EDIT_PICK
@@ -536,8 +549,8 @@ async def edit_pick_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     context.chat_data["edit_row_num"] = row_num
     context.chat_data["edit_row"]     = chosen
-    item  = chosen[2] if len(chosen) > 2 else "?"
-    price = chosen[3] if len(chosen) > 3 else "?"
+    item  = md_escape(chosen[2] if len(chosen) > 2 else "?")
+    price = md_escape(chosen[3] if len(chosen) > 3 else "?")
     kb    = _edit_field_keyboard(row_num, chosen)
     await query.edit_message_text(
         f"✏️ *#{_disp(row_num)} — {item}* ({price})\nTap a field to edit it:",
@@ -587,7 +600,7 @@ async def edit_pick_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # and /budgets, which match category names exactly (case-insensitive).
         await query.edit_message_text(
             f"✏️ Editing *{label}* for entry #{_disp(row_num)}\n"
-            f"Current value: `{current or '(none)'}`\n\n"
+            f"Current value: `{code_safe(current) or '(none)'}`\n\n"
             f"Pick a category, or type your own:",
             parse_mode="Markdown",
             reply_markup=_category_keyboard("editcat"),
@@ -597,7 +610,7 @@ async def edit_pick_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hint = EDIT_HINTS.get(field, "")
     await query.edit_message_text(
         f"✏️ Editing *{label}* for entry #{_disp(row_num)}\n"
-        f"Current value: `{current}`\n\n"
+        f"Current value: `{code_safe(current)}`\n\n"
         f"Type the new value{hint}:",
         parse_mode="Markdown",
     )
@@ -623,27 +636,39 @@ async def _finish_edit(context: ContextTypes.DEFAULT_TYPE, send, save_value: str
     """Shared save + cleanup for /edit, used by both the typed-value path and
     the category button path. `send(text, **kwargs)` delivers the result back
     to the user regardless of which path triggered it. Wrapped in try/except
-    so an unexpected error can't strand the /edit conversation the way an
-    unhandled exception here previously did (e.g. a field with no column
-    mapping in sheets.py).
+    so an unexpected error can't strand the /edit conversation.
     """
-    field   = context.chat_data.get("edit_field", "")
-    row_num = context.chat_data.get("edit_row_num")
-    name    = context.chat_data.get("edit_sheet", "")
-    label   = EDIT_FIELDS.get(field, ("that field",))[0]
+    field    = context.chat_data.get("edit_field", "")
+    row_num  = context.chat_data.get("edit_row_num")
+    name     = context.chat_data.get("edit_sheet", "")
+    snapshot = context.chat_data.get("edit_row")
+    label    = EDIT_FIELDS.get(field, ("that field",))[0]
 
     for k in ("edit_sheet", "edit_rows", "edit_page", "edit_row_num", "edit_row", "edit_field"):
         context.chat_data.pop(k, None)
 
+    # State lost (e.g. bot restarted mid-edit): never fall back to a blank sheet name,
+    # which would silently create an "Untitled" worksheet.
+    if field not in EDIT_FIELDS or row_num is None or not name:
+        await send("⚠️ That edit expired — please run /edit again.")
+        return ConversationHandler.END
+
     try:
+        # Row numbers shift after deletes/sorts; make sure it's still the same entry.
+        if snapshot is not None and not sheets.row_matches(name, row_num, snapshot):
+            await send("⚠️ The sheet changed since you opened this entry — nothing was edited. Please run /edit again.")
+            return ConversationHandler.END
         sheets.update_expense_field(name, row_num, field, save_value)
+        if field in ("price", "shared"):
+            sheets.recalc_per_person(name, row_num)  # keep Amount/Person consistent
     except Exception:
         logger.exception(f"Failed to save /edit for field={field!r}")
         await send("❌ Something went wrong saving that — please run /edit again.")
         return ConversationHandler.END
 
+    note = "\n_(Amount/Person was recalculated.)_" if field in ("price", "shared") else ""
     await send(
-        f"✅ *Updated!*\n{label} → `{save_value}`\n_(entry #{_disp(row_num)} in {name})_",
+        f"✅ *Updated!*\n{label} → `{code_safe(save_value)}`\n_(entry #{_disp(row_num)} in {md_escape(name)})_{note}",
         parse_mode="Markdown",
     )
     return ConversationHandler.END
@@ -653,6 +678,9 @@ async def edit_save_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """User typed a new value — validate and save."""
     raw_value = update.message.text.strip()
     field     = context.chat_data.get("edit_field", "")
+    if field not in EDIT_FIELDS:
+        await update.message.reply_text("⚠️ That edit expired — please run /edit again.")
+        return ConversationHandler.END
     label, _, needs_price = EDIT_FIELDS[field]
 
     if needs_price:
@@ -661,7 +689,7 @@ async def edit_save_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save_value = format_price(parsed)
         except ValueError:
             await update.message.reply_text(
-                "⚠️ Couldn't read that as a price. Try `25000`, `25.000`, or `25k`."
+                "⚠️ Couldn't read that as a price. Try 25000, 25.000, or 25k."
             )
             return EDIT_VALUE
     elif field == "date":
@@ -669,9 +697,17 @@ async def edit_save_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save_value = parse_date_input(raw_value)
         except ValueError:
             await update.message.reply_text(
-                "⚠️ Couldn't read that as a date. Try `25-06-2026`, `25-06-2026 14:30`, `today`, or `yesterday`."
+                "⚠️ Couldn't read that as a date. Try 25-06-2026, 25-06-2026 14:30, today, or yesterday."
             )
             return EDIT_VALUE
+    elif field == "shared":
+        names = list(dict.fromkeys(n.strip() for n in raw_value.split(",") if n.strip()))
+        if not names:
+            await update.message.reply_text("⚠️ Please give at least one name (comma-separated).")
+            return EDIT_VALUE
+        save_value = ", ".join(names)
+    elif field == "category":
+        save_value = _normalize_category(raw_value)
     else:
         save_value = raw_value
 
@@ -688,6 +724,9 @@ async def edit_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     all_rows = context.chat_data.get("edit_rows", [])
     name     = context.chat_data.get("edit_sheet", "")
     page     = context.chat_data.get("edit_page", 0)
+    if not name:
+        await query.edit_message_text("⚠️ That menu expired — please run /edit again.")
+        return ConversationHandler.END
     context.chat_data.pop("edit_row_num", None)
     context.chat_data.pop("edit_row",     None)
     context.chat_data.pop("edit_field",   None)
@@ -696,7 +735,7 @@ async def edit_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.chat_data["edit_rows"] = all_rows
     kb, total_pages = _edit_entry_keyboard(all_rows, page)
     await query.edit_message_text(
-        f"✏️ *Edit an entry* — *{name}*\nPage {page + 1}/{total_pages}",
+        f"✏️ *Edit an entry* — *{md_escape(name)}*\nPage {page + 1}/{total_pages}",
         parse_mode="Markdown", reply_markup=kb,
     )
     return EDIT_PICK
@@ -716,15 +755,16 @@ async def edit_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 
 def _list_row_text(row_num, row):
-    date    = row[0] if len(row) > 0 else "?"
-    place   = row[1] if len(row) > 1 else "?"
-    item    = row[2] if len(row) > 2 else "?"
-    price   = row[3] if len(row) > 3 else "?"
-    paid_by = row[4] if len(row) > 4 else "?"
-    shared  = row[5] if len(row) > 5 else "?"
-    per_p   = row[6] if len(row) > 6 else "?"
-    status  = row[8] if len(row) > 8 and row[8] else "⏳ Unpaid"
-    settled = row[9] if len(row) > 9 and row[9] else ""
+    e = md_escape
+    date    = e(row[0] if len(row) > 0 else "?")
+    place   = e(row[1] if len(row) > 1 else "?")
+    item    = e(row[2] if len(row) > 2 else "?")
+    price   = e(row[3] if len(row) > 3 else "?")
+    paid_by = e(row[4] if len(row) > 4 else "?")
+    shared  = e(row[5] if len(row) > 5 else "?")
+    per_p   = e(row[6] if len(row) > 6 else "?")
+    status  = e(row[8] if len(row) > 8 and row[8] else "⏳ Unpaid")
+    settled = e(row[9] if len(row) > 9 and row[9] else "")
     return (
         f"*#{_disp(row_num)} — {item}*\n"
         f"📍 {place}  |  💰 {price}  |  {status}\n"
@@ -749,13 +789,13 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name    = active_sheet_name(chat_id)
     all_rows = sheets.get_all_expenses(name)
     if not all_rows:
-        await update.message.reply_text(f"No entries yet in *{name}*.", parse_mode="Markdown")
+        await update.message.reply_text(f"No entries yet in *{md_escape(name)}*.", parse_mode="Markdown")
         return
     context.chat_data["list_rows"]  = all_rows
     context.chat_data["list_sheet"] = name
     total_pages = max(1, -(-len(all_rows) // LIST_PAGE_SIZE))
     page_rows = all_rows[0:LIST_PAGE_SIZE]
-    lines = [f"🧾 *{name}* — page 1/{total_pages}\n"]
+    lines = [f"🧾 *{md_escape(name)}* — page 1/{total_pages}\n"]
     for row_num, row in page_rows:
         lines.append(_list_row_text(row_num, row))
         lines.append("")
@@ -777,7 +817,7 @@ async def list_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     total_pages = max(1, -(-len(all_rows) // LIST_PAGE_SIZE))
     page = max(0, min(page, total_pages - 1))
     page_rows = all_rows[page * LIST_PAGE_SIZE:(page + 1) * LIST_PAGE_SIZE]
-    lines = [f"🧾 *{name}* — page {page + 1}/{total_pages}\n"]
+    lines = [f"🧾 *{md_escape(name)}* — page {page + 1}/{total_pages}\n"]
     for row_num, row in page_rows:
         lines.append(_list_row_text(row_num, row))
         lines.append("")
@@ -821,13 +861,13 @@ async def delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name     = active_sheet_name(chat_id)
     all_rows = sheets.get_all_expenses(name)
     if not all_rows:
-        await update.message.reply_text(f"No entries to delete in *{name}*.", parse_mode="Markdown")
+        await update.message.reply_text(f"No entries to delete in *{md_escape(name)}*.", parse_mode="Markdown")
         return
     context.chat_data["del_rows"]  = all_rows
     context.chat_data["del_sheet"] = name
     kb, total_pages = _delete_keyboard(all_rows, 0)
     await update.message.reply_text(
-        f"🗑️ *Delete an entry* — *{name}*\nPage 1/{total_pages}",
+        f"🗑️ *Delete an entry* — *{md_escape(name)}*\nPage 1/{total_pages}",
         parse_mode="Markdown", reply_markup=kb,
     )
 
@@ -843,9 +883,10 @@ async def delete_page_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         all_rows = sheets.get_all_expenses(name)
         context.chat_data["del_rows"]  = all_rows
         context.chat_data["del_sheet"] = name
+    page = max(0, min(page, max(1, -(-len(all_rows) // DELETE_PAGE_SIZE)) - 1))
     kb, total_pages = _delete_keyboard(all_rows, page)
     await query.edit_message_text(
-        f"🗑️ *Delete an entry* — *{name}*\nPage {page + 1}/{total_pages}",
+        f"🗑️ *Delete an entry* — *{md_escape(name)}*\nPage {page + 1}/{total_pages}",
         parse_mode="Markdown", reply_markup=kb,
     )
 
@@ -853,13 +894,25 @@ async def delete_page_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    row_num = int(query.data.split(":")[1])
-    name    = context.chat_data.get("del_sheet") or active_sheet_name(update.effective_chat.id)
+    row_num  = int(query.data.split(":")[1])
+    rows     = context.chat_data.get("del_rows")
+    name     = context.chat_data.get("del_sheet")
+    snapshot = next((r for rn, r in (rows or []) if rn == row_num), None)
+    # Without the cached snapshot we can't prove row_num still points at the entry
+    # the user tapped (numbers shift after deletes/sorts) — refuse rather than guess.
+    if not name or snapshot is None:
+        await query.edit_message_text("⚠️ That list expired — please run /delete again.")
+        return
+    if not sheets.row_matches(name, row_num, snapshot):
+        context.chat_data.pop("del_rows",  None)
+        context.chat_data.pop("del_sheet", None)
+        await query.edit_message_text("⚠️ The sheet changed since this list was shown — nothing was deleted. Run /delete again.")
+        return
     sheets.delete_row(name, row_num)
     # Invalidate cached rows since row numbers have shifted
     context.chat_data.pop("del_rows",  None)
     context.chat_data.pop("del_sheet", None)
-    await query.edit_message_text(f"🗑️ Deleted entry #{_disp(row_num)} from *{name}*.", parse_mode="Markdown")
+    await query.edit_message_text(f"🗑️ Deleted entry #{_disp(row_num)} from *{md_escape(name)}*.", parse_mode="Markdown")
 
 
 async def delete_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -879,7 +932,7 @@ async def undo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name     = active_sheet_name(chat_id)
     all_rows = sheets.get_all_expenses(name)  # newest (last appended) first
     if not all_rows:
-        await update.message.reply_text(f"Nothing to undo — *{name}* is empty.", parse_mode="Markdown")
+        await update.message.reply_text(f"Nothing to undo — *{md_escape(name)}* is empty.", parse_mode="Markdown")
         return
 
     row_num, row = all_rows[0]
@@ -893,14 +946,15 @@ async def undo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # sheet names (via /newevent) can run up to 90 chars, so embedding the
     # name directly here would crash this button for a long custom sheet name.
     context.chat_data["undo_sheet"] = name
+    context.chat_data["undo_row"]   = row
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("🗑️ Yes, undo it", callback_data=f"undo:{row_num}"),
         InlineKeyboardButton("Cancel", callback_data="undocancel"),
     ]])
     await update.message.reply_text(
         f"↩️ *Undo the last entry?*\n\n"
-        f"📅 {date}\n📍 {place} — {item}\n💰 {price}\n\n"
-        f"This removes it from *{name}*.",
+        f"📅 {md_escape(date)}\n📍 {md_escape(place)} — {md_escape(item)}\n💰 {md_escape(price)}\n\n"
+        f"This removes it from *{md_escape(name)}*.",
         parse_mode="Markdown", reply_markup=keyboard,
     )
 
@@ -909,12 +963,16 @@ async def undo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
     await query.answer()
     row_num = int(query.data.split(":")[1])
-    name    = context.chat_data.get("undo_sheet") or active_sheet_name(update.effective_chat.id)
+    name     = context.chat_data.get("undo_sheet")
+    snapshot = context.chat_data.get("undo_row")
+    if not name or snapshot is None:
+        await query.edit_message_text("⚠️ That prompt expired — please run /undo again.")
+        return
 
-    # Re-check it's still the most recent row before deleting — something else
+    # Re-check it's still the same, most recent row before deleting — something else
     # may have been added or removed since the confirmation prompt was sent.
     all_rows = sheets.get_all_expenses(name)
-    if not all_rows or all_rows[0][0] != row_num:
+    if not all_rows or all_rows[0][0] != row_num or not sheets.rows_equal(all_rows[0][1], snapshot):
         await query.edit_message_text(
             "⚠️ The sheet changed since this prompt — nothing was deleted.\n"
             "Use /list or /delete to remove a specific entry instead."
@@ -923,13 +981,15 @@ async def undo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sheets.delete_row(name, row_num)
     context.chat_data.pop("undo_sheet", None)
-    await query.edit_message_text(f"↩️ Undone — removed the last entry from *{name}*.", parse_mode="Markdown")
+    context.chat_data.pop("undo_row", None)
+    await query.edit_message_text(f"↩️ Undone — removed the last entry from *{md_escape(name)}*.", parse_mode="Markdown")
 
 
 async def undo_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     context.chat_data.pop("undo_sheet", None)
+    context.chat_data.pop("undo_row", None)
     await query.edit_message_text("Cancelled.")
 
 
@@ -1013,14 +1073,14 @@ async def markpaid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name     = active_sheet_name(chat_id)
     all_rows = sheets.get_all_expenses(name)
     if not all_rows:
-        await update.message.reply_text(f"No entries yet in *{name}*.", parse_mode="Markdown")
+        await update.message.reply_text(f"No entries yet in *{md_escape(name)}*.", parse_mode="Markdown")
         return
     context.chat_data["mk_sheet"] = name
     context.chat_data["mk_rows"]  = all_rows
     context.chat_data["mk_page"]  = 0
     kb, total_pages = _markpaid_keyboard(all_rows, 0)
     await update.message.reply_text(
-        f"💳 *Mark payment status* — *{name}*\n"
+        f"💳 *Mark payment status* — *{md_escape(name)}*\n"
         f"Page 1/{total_pages}  |  👥 = split bill",
         parse_mode="Markdown",
         reply_markup=kb,
@@ -1034,13 +1094,17 @@ async def mk_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
     page     = int(query.data.split(":")[1])
     all_rows = context.chat_data.get("mk_rows", [])
     name     = context.chat_data.get("mk_sheet", "")
+    if not name:
+        await query.edit_message_text("⚠️ That menu expired — please run /markpaid again.")
+        return
     if not all_rows:
         all_rows = sheets.get_all_expenses(name)
         context.chat_data["mk_rows"] = all_rows
+    page = max(0, min(page, max(1, -(-len(all_rows) // MARKPAID_PAGE_SIZE)) - 1))
     context.chat_data["mk_page"] = page
     kb, total_pages = _markpaid_keyboard(all_rows, page)
     await query.edit_message_text(
-        f"💳 *Mark payment status* — *{name}*\n"
+        f"💳 *Mark payment status* — *{md_escape(name)}*\n"
         f"Page {page + 1}/{total_pages}  |  👥 = split bill",
         parse_mode="Markdown",
         reply_markup=kb,
@@ -1056,8 +1120,8 @@ async def mk_pick_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chosen is None:
         await query.edit_message_text("Entry not found. Try /markpaid again.")
         return
-    item   = chosen[2] if len(chosen) > 2 else "?"
-    price  = chosen[3] if len(chosen) > 3 else "?"
+    item   = md_escape(chosen[2] if len(chosen) > 2 else "?")
+    price  = md_escape(chosen[3] if len(chosen) > 3 else "?")
     status = chosen[8] if len(chosen) > 8 and chosen[8] else "⏳ Unpaid"
 
     if _is_split(chosen):
@@ -1083,11 +1147,29 @@ async def mk_pick_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def _mk_verify(query, context, row_num):
+    """Shared guard for the /markpaid write actions. Returns the sheet name if it's
+    safe to write, else tells the user why not and returns None."""
+    name     = context.chat_data.get("mk_sheet")
+    rows     = context.chat_data.get("mk_rows") or []
+    snapshot = next((r for rn, r in rows if rn == row_num), None)
+    if not name or snapshot is None:
+        await query.edit_message_text("⚠️ That menu expired — please run /markpaid again.")
+        return None
+    if not sheets.row_matches(name, row_num, snapshot):
+        _mk_cleanup(context)
+        await query.edit_message_text("⚠️ The sheet changed since this list was shown — nothing was updated. Run /markpaid again.")
+        return None
+    return name
+
+
 async def mk_solo_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
     await query.answer()
     row_num = int(query.data.split(":")[1])
-    name    = context.chat_data.get("mk_sheet", "")
+    name    = await _mk_verify(query, context, row_num)
+    if name is None:
+        return
     new_status = sheets.toggle_paid_status(name, row_num)
     emoji = "✅" if new_status == "✅ Paid" else "⏳"
     _mk_cleanup(context)
@@ -1122,27 +1204,35 @@ async def mk_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
     await query.answer()
     row_num = int(query.data.split(":")[1])
-    name    = context.chat_data.get("mk_sheet", "")
-    settled = context.chat_data.get("mk_settled", set())
     names   = context.chat_data.get("mk_names", [])
+    settled = context.chat_data.get("mk_settled", set())
+    # If the person list was lost (e.g. bot restarted), saving would wipe the
+    # row's settled-by data — bail out instead.
+    if not names:
+        await query.edit_message_text("⚠️ That menu expired — please run /markpaid again.")
+        return
+    name = await _mk_verify(query, context, row_num)
+    if name is None:
+        return
     ordered   = [n for n in names if n in settled]
     remaining = [n for n in names if n not in settled]
     sheets.set_settled_by(name, row_num, ordered)
 
     # Auto-sync the Status column based on individual settlements
-    if len(ordered) == len(names) and names:
+    if not remaining:
         # Everyone settled → mark whole entry as ✅ Paid
         sheets.set_paid_status_bulk(name, [row_num], "✅ Paid")
     else:
         # Someone still unpaid → make sure Status shows ⏳ Unpaid
         sheets.set_paid_status_bulk(name, [row_num], "⏳ Unpaid")
 
+    e = md_escape
     if not ordered:
         summary = "No one marked as settled yet."
     elif not remaining:
         summary = "Everyone has settled! 🎉"
     else:
-        summary = f"✅ Settled: {', '.join(ordered)}\n⏳ Still owes: {', '.join(remaining)}"
+        summary = f"✅ Settled: {e(', '.join(ordered))}\n⏳ Still owes: {e(', '.join(remaining))}"
     _mk_cleanup(context)
     await query.edit_message_text(f"💾 *Saved — #{_disp(row_num)}*\n{summary}", parse_mode="Markdown")
 
@@ -1153,6 +1243,9 @@ async def mk_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     all_rows = context.chat_data.get("mk_rows", [])
     name     = context.chat_data.get("mk_sheet", "")
     page     = context.chat_data.get("mk_page", 0)
+    if not name:
+        await query.edit_message_text("⚠️ That menu expired — please run /markpaid again.")
+        return
     context.chat_data.pop("mk_names",   None)
     context.chat_data.pop("mk_settled", None)
     if not all_rows:
@@ -1160,7 +1253,7 @@ async def mk_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.chat_data["mk_rows"] = all_rows
     kb, total_pages = _markpaid_keyboard(all_rows, page)
     await query.edit_message_text(
-        f"💳 *Mark payment status* — *{name}*\n"
+        f"💳 *Mark payment status* — *{md_escape(name)}*\n"
         f"Page {page + 1}/{total_pages}  |  👥 = split bill",
         parse_mode="Markdown", reply_markup=kb,
     )
@@ -1187,7 +1280,7 @@ async def newevent_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sheets.get_or_create_worksheet(name)
     state.set_active_sheet(update.effective_chat.id, name)
     await update.message.reply_text(
-        f"✅ Created sheet *{name}* and switched to it.", parse_mode="Markdown"
+        f"✅ Created sheet *{md_escape(name)}* and switched to it.", parse_mode="Markdown"
     )
     return ConversationHandler.END
 
@@ -1244,6 +1337,28 @@ async def switch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # /summary
 # ---------------------------------------------------------------------------
 
+def _parse_scope_dates(text: str, scope):
+    """Parses the user's typed date(s) for a 'day' or 'range' scope.
+    Returns (start, end) as zero-padded DD-MM-YYYY strings; raises ValueError with a
+    user-facing message otherwise. Replaces three copies of the same code, one of which
+    mangled input by deleting every "to" substring."""
+    from datetime import datetime as dt
+    found = re.findall(r"\d{1,2}-\d{1,2}-\d{4}", text)
+    need  = 1 if scope == "day" else 2
+    if len(found) != need:
+        if need == 1:
+            raise ValueError("Please provide exactly one date, e.g. 20-06-2026.")
+        raise ValueError("Please provide two dates, e.g. 15-06-2026 to 20-06-2026.")
+    try:
+        parsed = [dt.strptime(d, "%d-%m-%Y") for d in found]
+    except ValueError:
+        raise ValueError("Invalid date. Use DD-MM-YYYY, e.g. 20-06-2026.")
+    if need == 2 and parsed[0] > parsed[1]:
+        parsed.reverse()  # forgive an end date typed before the start date
+    out = [d.strftime("%d-%m-%Y") for d in parsed]
+    return (out[0], out[0]) if need == 1 else (out[0], out[1])
+
+
 async def summary_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [
         [InlineKeyboardButton("📊 Smart (Optimized)", callback_data="sum_mode:smart")],
@@ -1285,26 +1400,11 @@ async def summary_scope(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def summary_date_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text  = update.message.text.strip().lower().replace("to", " ").split()
     scope = context.chat_data.get("summary_scope")
-    start_date_str = end_date_str = None
     try:
-        from datetime import datetime as dt
-        if scope == "day":
-            if len(text) != 1:
-                await update.message.reply_text("Please provide exactly one date (e.g. `20-06-2026`).")
-                return SUMMARY_DATE_INPUT
-            start_date_str = end_date_str = text[0]
-            dt.strptime(start_date_str, "%d-%m-%Y")
-        else:
-            if len(text) != 2:
-                await update.message.reply_text("Please provide two dates (e.g. `15-06-2026 20-06-2026`).")
-                return SUMMARY_DATE_INPUT
-            start_date_str, end_date_str = text[0], text[1]
-            dt.strptime(start_date_str, "%d-%m-%Y")
-            dt.strptime(end_date_str,   "%d-%m-%Y")
-    except ValueError:
-        await update.message.reply_text("⚠️ Invalid date format. Use DD-MM-YYYY.")
+        start_date_str, end_date_str = _parse_scope_dates(update.message.text, scope)
+    except ValueError as e:
+        await update.message.reply_text(f"⚠️ {e}")
         return SUMMARY_DATE_INPUT
     return await execute_summary(update.effective_chat.id, context, update.message, start_date_str, end_date_str, edit=False)
 
@@ -1317,7 +1417,7 @@ async def execute_summary(chat_id, context, message_obj, start_date_str, end_dat
         date_msg = start_date_str
     elif start_date_str and end_date_str:
         date_msg = f"{start_date_str} to {end_date_str}"
-    calc_text = f"📊 Calculating for *{sheet_name}* ({date_msg})..."
+    calc_text = f"📊 Calculating for *{md_escape(sheet_name)}* ({date_msg})..."
     if edit:
         await message_obj.edit_text(calc_text, parse_mode="Markdown")
     else:
@@ -1378,26 +1478,11 @@ async def totals_scope(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def totals_date_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text  = update.message.text.strip().lower().replace("to", " ").split()
     scope = context.chat_data.get("totals_scope")
-    start_date_str = end_date_str = None
     try:
-        from datetime import datetime as dt
-        if scope == "day":
-            if len(text) != 1:
-                await update.message.reply_text("Please provide exactly one date (e.g. `20-06-2026`).")
-                return TOTALS_DATE_INPUT
-            start_date_str = end_date_str = text[0]
-            dt.strptime(start_date_str, "%d-%m-%Y")
-        else:
-            if len(text) != 2:
-                await update.message.reply_text("Please provide two dates (e.g. `15-06-2026 20-06-2026`).")
-                return TOTALS_DATE_INPUT
-            start_date_str, end_date_str = text[0], text[1]
-            dt.strptime(start_date_str, "%d-%m-%Y")
-            dt.strptime(end_date_str,   "%d-%m-%Y")
-    except ValueError:
-        await update.message.reply_text("⚠️ Invalid date format. Use DD-MM-YYYY.")
+        start_date_str, end_date_str = _parse_scope_dates(update.message.text, scope)
+    except ValueError as e:
+        await update.message.reply_text(f"⚠️ {e}")
         return TOTALS_DATE_INPUT
     return await execute_totals(update.effective_chat.id, context, update.message, start_date_str, end_date_str, edit=False)
 
@@ -1410,7 +1495,7 @@ async def execute_totals(chat_id, context, message_obj, start_date_str, end_date
     elif start_date_str and end_date_str:
         date_msg = f"{start_date_str} to {end_date_str}"
 
-    wait_text = f"⏳ Calculating totals for *{sheet_name}* ({date_msg})..."
+    wait_text = f"⏳ Calculating totals for *{md_escape(sheet_name)}* ({date_msg})..."
     if edit:
         await message_obj.edit_text(wait_text, parse_mode="Markdown")
     else:
@@ -1419,15 +1504,15 @@ async def execute_totals(chat_id, context, message_obj, start_date_str, end_date
     try:
         totals = sheets.get_person_totals(sheet_name, start_date_str, end_date_str)
         if not totals:
-            text = f"No entries found in *{sheet_name}* for {date_msg}."
+            text = f"No entries found in *{md_escape(sheet_name)}* for {date_msg}."
         else:
             grand_total = sum(totals.values())
             # Sort by amount descending
             sorted_totals = sorted(totals.items(), key=lambda x: x[1], reverse=True)
-            lines = [f"💰 *Total spending per person*\n_{sheet_name} — {date_msg}_\n"]
+            lines = [f"💰 *Total spending per person*\n_{md_escape(sheet_name)} — {date_msg}_\n"]
             for i, (person, amt) in enumerate(sorted_totals):
                 pct = (amt / grand_total * 100) if grand_total else 0
-                lines.append(f"{i + 1}. *{person}*: {format_price(amt)} ({pct:.1f}%)")
+                lines.append(f"{i + 1}. *{md_escape(person)}*: {format_price(amt)} ({pct:.1f}%)")
             lines.append(f"\n*Grand total: {format_price(grand_total)}*")
             text = "\n".join(lines)
         await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
@@ -1466,6 +1551,9 @@ async def add_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
         price = parse_price(update.message.text)
     except ValueError:
         await update.message.reply_text("Couldn't read that price, try again e.g. 25000 or 25k")
+        return ADD_PRICE
+    if price <= 0:
+        await update.message.reply_text("The price must be greater than 0 — try again.")
         return ADD_PRICE
     context.chat_data["draft"]["price"] = price
     sender = update.effective_user.first_name
@@ -1507,7 +1595,7 @@ async def add_category_button(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def add_category_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.chat_data["draft"]["category"] = update.message.text.strip()
+    context.chat_data["draft"]["category"] = _normalize_category(update.message.text.strip())
     return await _ask_add_date(update.effective_chat.id, context, update.message, edit=False)
 
 
@@ -1560,13 +1648,13 @@ async def _show_add_confirm(chat_id, context, message_obj, edit=False):
     date_display = draft["date_str"].split(" ")[0] if draft.get("date_str") else "Today (now)"
     summary = (
         f"📋 *Confirm entry*\n"
-        f"Place: {draft['place']}\n"
-        f"Item: {draft['item']}\n"
+        f"Place: {md_escape(draft['place'])}\n"
+        f"Item: {md_escape(draft['item'])}\n"
         f"Price: {format_price(draft['price'])}\n"
-        f"Paid by: {draft['paid_by']}\n"
-        f"Category: {draft.get('category', '—')}\n"
+        f"Paid by: {md_escape(draft['paid_by'])}\n"
+        f"Category: {md_escape(draft.get('category') or '—')}\n"
         f"Date: {date_display}\n\n"
-        f"Sheet: {active_sheet_name(chat_id)}"
+        f"Sheet: {md_escape(active_sheet_name(chat_id))}"
     )
     kb = [[InlineKeyboardButton("✅ Save", callback_data="add_save"),
            InlineKeyboardButton("❌ Cancel", callback_data="add_cancel")]]
@@ -1584,7 +1672,10 @@ async def add_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.chat_data.pop("draft", None)
         await query.edit_message_text("Cancelled.")
         return ConversationHandler.END
-    draft      = context.chat_data.pop("draft")
+    draft      = context.chat_data.pop("draft", None)
+    if not draft:
+        await query.edit_message_text("⚠️ That entry expired — please run /add again.")
+        return ConversationHandler.END
     chat_id    = update.effective_chat.id
     sheet_name = active_sheet_name(chat_id)
     category   = draft.get("category", "")
@@ -1594,7 +1685,7 @@ async def add_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         category=category, date_str=draft.get("date_str"),
     )
     warning = _budget_warnings(chat_id, sheet_name, category)
-    await query.edit_message_text(f"✅ Saved to *{sheet_name}*!{warning}", parse_mode="Markdown")
+    await query.edit_message_text(f"✅ Saved to *{md_escape(sheet_name)}*!{warning}", parse_mode="Markdown")
     return ConversationHandler.END
 
 
@@ -1638,17 +1729,21 @@ async def split_category_btn(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.edit_message_text("✍️ Type your custom category:")
         return SPLIT_CATEGORY
     context.chat_data["split"]["category"] = value
-    await query.edit_message_text(f"Category: {value}\n\nWho paid the bill overall?")
+    await query.edit_message_text(f"Category: {value}")
     return await _split_ask_payer(update, context)
 
 
 async def split_category_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.chat_data["split"]["category"] = update.message.text.strip()
-    await update.message.reply_text("Who paid the bill overall?")
+    context.chat_data["split"]["category"] = _normalize_category(update.message.text.strip())
     return await _split_ask_payer(update, context)
 
 
 async def _split_ask_payer(update, context):
+    """Asks who paid — with member buttons if members are saved, else as plain text.
+    (Previously the prompt was sent by the callers *and* again here, so people with
+    saved members saw it twice.)"""
+    msg_text = "Who paid the bill overall?"
+    msg = update.callback_query.message if update.callback_query else update.message
     members = state.get_members(update.effective_chat.id)
     if members:
         kb = []
@@ -1662,11 +1757,9 @@ async def _split_ask_payer(update, context):
                 kb.append(row); row = []
         if row: kb.append(row)
         kb.append([InlineKeyboardButton("✍️ Type manually...", callback_data="payer:manual")])
-        msg_text = "Who paid the bill overall?"
-        if hasattr(update, 'callback_query') and update.callback_query:
-            await update.callback_query.message.reply_text(msg_text, reply_markup=InlineKeyboardMarkup(kb))
-        else:
-            await update.message.reply_text(msg_text, reply_markup=InlineKeyboardMarkup(kb))
+        await msg.reply_text(msg_text, reply_markup=InlineKeyboardMarkup(kb))
+    else:
+        await msg.reply_text(msg_text)
     return SPLIT_PAYER
 
 
@@ -1685,7 +1778,7 @@ async def split_payer_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     context.chat_data["split"]["payer"] = payer
     await query.edit_message_text(
-        f"Paid by: {payer}\n\nSend each item as:\n`Item | Price | Names`\nExample: `Nasi Goreng | 25000 | Andi, Budi`\n\nType /done when finished.",
+        f"Paid by: {md_escape(payer)}\n\nSend each item as:\n`Item | Price | Names`\nExample: `Nasi Goreng | 25000 | Andi, Budi`\n\nType /done when finished.",
         parse_mode="Markdown",
     )
     return SPLIT_ITEMS
@@ -1711,7 +1804,10 @@ async def split_item_line(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("Couldn't read that price, try again.")
         return SPLIT_ITEMS
-    names = [n.strip() for n in names_raw.split(",") if n.strip()]
+    if price <= 0:
+        await update.message.reply_text("The price must be greater than 0 — try again.")
+        return SPLIT_ITEMS
+    names = list(dict.fromkeys(n.strip() for n in names_raw.split(",") if n.strip()))
     if not names:
         await update.message.reply_text("Please list at least one name.")
         return SPLIT_ITEMS
@@ -1731,8 +1827,11 @@ async def split_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def split_tax(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         tax_pct = float(update.message.text.strip().replace("%", ""))
+        # float() happily accepts "nan", "inf" and negatives — all of which would corrupt the bill.
+        if not math.isfinite(tax_pct) or not (0 <= tax_pct <= 100):
+            raise ValueError
     except ValueError:
-        await update.message.reply_text("Please send a number e.g. 10 or 0.")
+        await update.message.reply_text("Please send a number between 0 and 100, e.g. 10 or 0.")
         return SPLIT_TAX
     split = context.chat_data["split"]
     split["tax_pct"] = tax_pct
@@ -1744,8 +1843,8 @@ async def split_tax(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for it in items:
         share = it["price"] / len(it["names"])
         lines.append(
-            f"• {it['item']} — {format_price(it['price'])} ÷ {len(it['names'])} "
-            f"({', '.join(it['names'])}) = {format_price(share)}/person"
+            f"• {md_escape(it['item'])} — {format_price(it['price'])} ÷ {len(it['names'])} "
+            f"({md_escape(', '.join(it['names']))}) = {format_price(share)}/person"
         )
         for n in it["names"]:
             subtotals[n] = subtotals.get(n, 0) + share
@@ -1763,11 +1862,11 @@ async def split_tax(update: Update, context: ContextTypes.DEFAULT_TYPE):
             person_tax = (subtotals[n] / subtotal) * total_tax if subtotal else 0
             totals[n] = subtotals[n] + person_tax
 
-    lines.append(f"\n💰 *Paid by:* {split['payer']}")
+    lines.append(f"\n💰 *Paid by:* {md_escape(split['payer'])}")
     lines.append("*Final amounts owed (tax included):*")
     for n, amt in totals.items():
         note = " (payer)" if n.lower() == split["payer"].lower() else ""
-        lines.append(f"  {n}: {format_price(amt)}{note}")
+        lines.append(f"  {md_escape(n)}: {format_price(amt)}{note}")
 
     split["totals"]   = totals
     split["subtotals"] = subtotals
@@ -1784,7 +1883,10 @@ async def split_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.chat_data.pop("split", None)
         await query.edit_message_text("Cancelled.")
         return ConversationHandler.END
-    split      = context.chat_data.pop("split")
+    split      = context.chat_data.pop("split", None)
+    if not split:
+        await query.edit_message_text("⚠️ That bill expired — please run /split again.")
+        return ConversationHandler.END
     chat_id    = update.effective_chat.id
     sheet_name = active_sheet_name(chat_id)
     payer      = split["payer"]
@@ -1804,7 +1906,7 @@ async def split_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             taxed_share, category=cat,
         )
     await query.edit_message_text(
-        f"✅ Saved {len(split['items'])} item(s) to *{sheet_name}*!"
+        f"✅ Saved {len(split['items'])} item(s) to *{md_escape(sheet_name)}*!"
         + (f"\n_(prices include {tax_pct}% tax, split proportionally)_" if tax_pct else "")
         + _budget_warnings(chat_id, sheet_name, cat),
         parse_mode="Markdown",
@@ -1831,13 +1933,13 @@ async def even_category_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def even_category_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.chat_data["even"]["category"] = update.message.text.strip()
+    context.chat_data["even"]["category"] = _normalize_category(update.message.text.strip())
     await update.message.reply_text("Who's splitting this? (comma-separated names)")
     return EVEN_NAMES
 
 
 async def even_names(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    names = [n.strip() for n in update.message.text.split(",") if n.strip()]
+    names = list(dict.fromkeys(n.strip() for n in update.message.text.split(",") if n.strip()))
     if not names:
         await update.message.reply_text("Please give at least one name.")
         return EVEN_NAMES
@@ -1891,6 +1993,9 @@ async def even_total(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("Couldn't read that amount, try again.")
         return EVEN_TOTAL
+    if total <= 0:
+        await update.message.reply_text("The total must be greater than 0 — try again.")
+        return EVEN_TOTAL
     context.chat_data["even"]["total"] = total
     await update.message.reply_text("Give this bill a short name (e.g. 'Dinner at Resto X')")
     return EVEN_LABEL
@@ -1902,9 +2007,9 @@ async def even_label(update: Update, context: ContextTypes.DEFAULT_TYPE):
     per_person         = round(even["total"] / len(even["names"]), 2)
     even["per_person"] = per_person
     summary = (
-        f"➗ *Even Split Summary*\n{even['label']}\n"
-        f"Total: {format_price(even['total'])}\nPaid by: {even['payer']}\n"
-        f"Split between: {', '.join(even['names'])}\nEach owes: {format_price(per_person)}"
+        f"➗ *Even Split Summary*\n{md_escape(even['label'])}\n"
+        f"Total: {format_price(even['total'])}\nPaid by: {md_escape(even['payer'])}\n"
+        f"Split between: {md_escape(', '.join(even['names']))}\nEach owes: {format_price(per_person)}"
     )
     kb = [[InlineKeyboardButton("✅ Save to Sheet", callback_data="evensave"),
            InlineKeyboardButton("❌ Cancel",        callback_data="evencancel")]]
@@ -1919,7 +2024,10 @@ async def even_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.chat_data.pop("even", None)
         await query.edit_message_text("Cancelled.")
         return ConversationHandler.END
-    even       = context.chat_data.pop("even")
+    even       = context.chat_data.pop("even", None)
+    if not even:
+        await query.edit_message_text("⚠️ That bill expired — please run /split again.")
+        return ConversationHandler.END
     chat_id    = update.effective_chat.id
     sheet_name = active_sheet_name(chat_id)
     category   = even.get("category", "")
@@ -1927,7 +2035,7 @@ async def even_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
                           even["payer"], ", ".join(even["names"]), even["per_person"],
                           category=category)
     warning = _budget_warnings(chat_id, sheet_name, category)
-    await query.edit_message_text(f"✅ Saved to *{sheet_name}*!{warning}", parse_mode="Markdown")
+    await query.edit_message_text(f"✅ Saved to *{md_escape(sheet_name)}*!{warning}", parse_mode="Markdown")
     return ConversationHandler.END
 
 
@@ -1981,13 +2089,15 @@ async def _new_month_check(context):
 
     month_name = sheets.current_month_sheet_name()
     for chat_id in state.get_known_chats():
-        current = state.get_active_sheet(chat_id)
         try:
+            # Inside the try: one chat's Sheets/Telegram failure must not stop the others.
+            current = state.get_active_sheet(chat_id)
+            still = f"Your active sheet is still *{md_escape(current)}*" if current else "You haven't picked a sheet yet"
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=(
                     f"🗓️ *New month started — {month_name}*\n\n"
-                    f"Your active sheet is still *{current}* — it won't switch on its own. "
+                    f"{still} — it won't switch on its own. "
                     f"Run /switch and pick *📅 This month ({month_name})* when you're "
                     f"ready to start logging into the new tab."
                 ),
@@ -2058,7 +2168,7 @@ async def setreminder_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     existing = state.get_reminders(chat_id)
     await update.message.reply_text(
         f"✅ Reminder added at *{hour_wib:02d}:{minute:02d} WIB*\n"
-        f"📝 Message: _{message}_\n\n"
+        f"📝 Message: _{md_escape(message)}_\n\n"
         f"You now have *{len(existing)}* reminder(s). Use /listreminders to see them all.",
         parse_mode="Markdown",
     )
@@ -2086,7 +2196,7 @@ async def listreminders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [f"⏰ *Your reminders ({len(reminders)} total):*\n"]
     for i, r in enumerate(reminders, 1):
         hour_wib = (r["hour"] + WIB_OFFSET) % 24
-        lines.append(f"*{i}. {hour_wib:02d}:{r['minute']:02d} WIB*  —  {r['message']}")
+        lines.append(f"*{i}. {hour_wib:02d}:{r['minute']:02d} WIB*  —  {md_escape(r['message'])}")
         lines.append(f"    ID: `{r['id']}`")
     lines.append("\nUse /stopreminder to remove one.")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
@@ -2144,7 +2254,7 @@ async def stopreminder_callback(update: Update, context: ContextTypes.DEFAULT_TY
         state.delete_reminder(chat_id, rid)
         hour_wib = (target["hour"] + WIB_OFFSET) % 24
         await query.edit_message_text(
-            f"🗑️ Removed: *{hour_wib:02d}:{target['minute']:02d} WIB* — {target['message']}",
+            f"🗑️ Removed: *{hour_wib:02d}:{target['minute']:02d} WIB* — {md_escape(target['message'])}",
             parse_mode="Markdown",
         )
     else:
@@ -2183,26 +2293,11 @@ async def overview_scope(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def overview_date_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text  = update.message.text.strip().lower().replace("to", " ").split()
     scope = context.chat_data.get("ov_scope")
-    start_date_str = end_date_str = None
     try:
-        from datetime import datetime as dt
-        if scope == "day":
-            if len(text) != 1:
-                await update.message.reply_text("Please provide exactly one date (e.g. `20-06-2026`).")
-                return OVERVIEW_DATE_INPUT
-            start_date_str = end_date_str = text[0]
-            dt.strptime(start_date_str, "%d-%m-%Y")
-        else:
-            if len(text) != 2:
-                await update.message.reply_text("Please provide two dates.")
-                return OVERVIEW_DATE_INPUT
-            start_date_str, end_date_str = text[0], text[1]
-            dt.strptime(start_date_str, "%d-%m-%Y")
-            dt.strptime(end_date_str,   "%d-%m-%Y")
-    except ValueError:
-        await update.message.reply_text("⚠️ Invalid date format. Use DD-MM-YYYY.")
+        start_date_str, end_date_str = _parse_scope_dates(update.message.text, scope)
+    except ValueError as e:
+        await update.message.reply_text(f"⚠️ {e}")
         return OVERVIEW_DATE_INPUT
     return await execute_overview(update.effective_chat.id, context, update.message, start_date_str, end_date_str, edit=False)
 
@@ -2215,7 +2310,7 @@ async def execute_overview(chat_id, context, message_obj, start_date_str, end_da
     elif start_date_str and end_date_str:
         date_msg = f"{start_date_str} to {end_date_str}"
 
-    wait = f"⏳ Calculating overview for *{sheet_name}* ({date_msg})..."
+    wait = f"⏳ Calculating overview for *{md_escape(sheet_name)}* ({date_msg})..."
     if edit:
         await message_obj.edit_text(wait, parse_mode="Markdown")
     else:
@@ -2224,19 +2319,19 @@ async def execute_overview(chat_id, context, message_obj, start_date_str, end_da
     try:
         cats = sheets.get_category_overview(sheet_name, start_date_str, end_date_str)
         if not cats:
-            text = f"No entries found in *{sheet_name}* for {date_msg}."
+            text = f"No entries found in *{md_escape(sheet_name)}* for {date_msg}."
         else:
             grand_total = sum(v["total"] for v in cats.values())
             lines = [
                 f"🏷️ *Spending by category*\n"
-                f"_{sheet_name} — {date_msg}_\n"
+                f"_{md_escape(sheet_name)} — {date_msg}_\n"
                 f"_(shows full bill amount per category, not per-person)_\n"
             ]
             for i, (cat, data) in enumerate(cats.items(), 1):
                 pct = data["total"] / grand_total * 100 if grand_total else 0
                 bar = "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
                 lines.append(
-                    f"*{i}. {cat}*\n"
+                    f"*{i}. {md_escape(cat)}*\n"
                     f"   {bar} {pct:.1f}%\n"
                     f"   {format_price(data['total'])}  ({data['count']} entr{'y' if data['count']==1 else 'ies'})"
                 )
@@ -2281,10 +2376,10 @@ def _budget_warning(chat_id: int, sheet_name: str, category: str) -> str:
             break
     pct = spent / limit * 100
     if pct >= 100:
-        return (f"\n\n🔴 *Budget alert:* {category} is now {format_price(spent)} / "
+        return (f"\n\n🔴 *Budget alert:* {md_escape(category)} is now {format_price(spent)} / "
                 f"{format_price(limit)} ({pct:.0f}%) — over budget!")
     if pct >= 80:
-        return (f"\n\n🟡 *Budget heads-up:* {category} is now {format_price(spent)} / "
+        return (f"\n\n🟡 *Budget heads-up:* {md_escape(category)} is now {format_price(spent)} / "
                 f"{format_price(limit)} ({pct:.0f}%) of budget.")
     return ""
 
@@ -2310,7 +2405,14 @@ def _overall_budget_warning(chat_id: int, sheet_name: str) -> str:
 
 def _budget_warnings(chat_id: int, sheet_name: str, category: str) -> str:
     """Combined per-category + overall budget alert text, appended after saving."""
-    return _budget_warning(chat_id, sheet_name, category) + _overall_budget_warning(chat_id, sheet_name)
+    # The expense is already saved by the time this runs; a Sheets/API hiccup while
+    # computing the alert must not turn a successful save into an error message
+    # (the user would retry and log it twice).
+    try:
+        return _budget_warning(chat_id, sheet_name, category) + _overall_budget_warning(chat_id, sheet_name)
+    except Exception:
+        logger.warning("Budget check failed", exc_info=True)
+        return ""
 
 
 SETBUDGET_USAGE = (
@@ -2366,7 +2468,9 @@ async def setbudget_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     price_raw = parts[-1]
-    category  = " ".join(parts[:-1]).strip()
+    # Snap to the same canonical names /add and /q use ("Food" -> "Food & Drink"), otherwise
+    # the budget never matches any expense and its alerts silently never fire.
+    category  = _normalize_category(" ".join(parts[:-1]).strip())
 
     try:
         amount = parse_price(price_raw)
@@ -2388,14 +2492,14 @@ async def setbudget_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     removed = True
                     break
         if removed:
-            await update.message.reply_text(f"🗑️ Budget removed for *{category}*.", parse_mode="Markdown")
+            await update.message.reply_text(f"🗑️ Budget removed for *{md_escape(category)}*.", parse_mode="Markdown")
         else:
-            await update.message.reply_text(f"No budget was set for *{category}*.", parse_mode="Markdown")
+            await update.message.reply_text(f"No budget was set for *{md_escape(category)}*.", parse_mode="Markdown")
         return
 
     state.set_budget(chat_id, category, amount)
     await update.message.reply_text(
-        f"✅ Budget set: *{category}* → {format_price(amount)}\n"
+        f"✅ Budget set: *{md_escape(category)}* → {format_price(amount)}\n"
         f"_(tracked against the active sheet — you'll get a heads-up at 80% and 100%)_",
         parse_mode="Markdown",
     )
@@ -2418,7 +2522,7 @@ async def budgets_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         filled = min(10, int(pct / 10))
         bar    = "█" * filled + "░" * (10 - filled)
         emoji  = "🔴" if pct >= 100 else ("🟡" if pct >= 80 else "🟢")
-        return f"{emoji} *{label}*\n   {bar} {pct:.0f}%\n   {format_price(spent)} / {format_price(limit)}"
+        return f"{emoji} *{md_escape(label)}*\n   {bar} {pct:.0f}%\n   {format_price(spent)} / {format_price(limit)}"
 
     lines = [f"💰 *Budgets — {name}*\n"]
 
@@ -2476,7 +2580,10 @@ async def _post_init(app):
 def main():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    app = ApplicationBuilder().token(config.TELEGRAM_BOT_TOKEN).post_init(_post_init).build()
+    
+    # Increased HTTP request timeout to prevent network drop/timeout on cloud hosting
+    request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
+    app = ApplicationBuilder().token(config.TELEGRAM_BOT_TOKEN).request(request).post_init(_post_init).build()
 
     # Restore saved reminders from state.json on startup
     for chat_id, reminders in state.get_all_reminders().items():
@@ -2654,6 +2761,9 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel_cmd)],
     )
     app.add_handler(split_conv)
+
+    # Registered last: inside a conversation its own /cancel fallback wins; anywhere else this answers.
+    app.add_handler(CommandHandler("cancel", cancel_cmd))
 
     app.add_error_handler(error_handler)
     logger.info("Bot starting (polling)...")

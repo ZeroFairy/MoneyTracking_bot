@@ -1,23 +1,32 @@
 """Small text/number helpers."""
+import re
+
+
+_PRICE_SUFFIXES = (("jt", 1_000_000), ("m", 1_000_000), ("rb", 1_000), ("k", 1_000))
 
 
 def parse_price(raw: str) -> float:
     """Parse a loosely-formatted price string into a float.
 
-    Accepts things like: "25000", "25.000", "25,000", "Rp25000", "25k"
+    Accepts things like: "25000", "25.000", "25,000", "Rp25000", "25k",
+    "1.5k", "2m" / "2jt" (millions), "500rb" (thousands).
     Assumes IDR-style formatting where '.' and ',' are thousand separators
-    (decimals in currency text are rare/ignored here).
+    (decimals are only understood together with a k/m/jt/rb suffix).
+    Raises ValueError for anything else (negative, NaN, junk, empty).
     """
-    s = raw.strip().lower().replace("rp", "").replace(" ", "")
-    if s.endswith("k"):
-        # e.g. "25k" -> 25000, "1.5k" -> 1500
-        body = s[:-1].replace(",", ".")
-        try:
-            return float(body) * 1000
-        except ValueError:
+    s = str(raw).strip().lower().replace("rp", "").replace(" ", "")
+    mult = 1
+    for suffix, factor in _PRICE_SUFFIXES:
+        if s.endswith(suffix):
+            s, mult = s[: -len(suffix)], factor
+            break
+    if mult != 1:
+        body = s.replace(",", ".")
+        if not re.fullmatch(r"\d+(?:\.\d+)?", body, re.ASCII):
             raise ValueError(f"Could not parse price from: {raw!r}")
+        return float(body) * mult
     s = s.replace(".", "").replace(",", "")
-    if not s.isdigit():
+    if not re.fullmatch(r"\d+", s, re.ASCII):
         raise ValueError(f"Could not parse price from: {raw!r}")
     return float(s)
 
@@ -63,7 +72,7 @@ def parse_date_input(raw: str) -> str:
     from datetime import datetime, timedelta
 
     parts = raw.strip().split()
-    if not parts:
+    if not parts or len(parts) > 2:
         raise ValueError(f"Could not parse date from: {raw!r}")
 
     now = now_wib()
@@ -93,3 +102,20 @@ def parse_date_input(raw: str) -> str:
         time_str = now.strftime("%H:%M")
 
     return f"{date_part.strftime('%d-%m-%Y')} {time_str}"
+
+
+def md_escape(text) -> str:
+    """Escape user-supplied text for Telegram's legacy "Markdown" parse mode.
+
+    Without this, a name like "Mie_Ayam" or "Kopi*Susu" makes Telegram reject
+    the whole message ("can't parse entities").
+    """
+    s = str(text)
+    for ch in ("_", "*", "`", "["):
+        s = s.replace(ch, "\\" + ch)
+    return s
+
+
+def code_safe(text) -> str:
+    """For text placed inside a `code span` (escaping isn't allowed there)."""
+    return str(text).replace("`", "'")

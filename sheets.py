@@ -2,11 +2,14 @@
 from datetime import datetime
 
 import gspread
+from gspread.utils import rowcol_to_a1
 
 from config import GOOGLE_CREDENTIALS_FILE, GOOGLE_SHEETS_ID
-from utils import now_wib, format_price, parse_price
+from utils import now_wib, format_price, parse_price, md_escape
 
 HEADERS = ["Date & Time", "Place", "Buying List", "Price", "Paid By", "Shared By", "Amount/Person", "Picture", "Status", "Settled By", "Category"]
+
+STATE_PREFIX = "BotState_"  # internal tabs (active sheet, members, reminders, budgets...)
 
 _gc = None
 _sh = None
@@ -26,6 +29,28 @@ def _spreadsheet():
     return _sh
 
 
+def _set_cell(ws, row: int, col: int, value):
+    """Write one plain-text (RAW) cell. update_cell() may parse the value
+    (dates/numbers/formulas) depending on the gspread version."""
+    ws.update(range_name=rowcol_to_a1(row, col), values=[[value]])
+
+
+def _name_canon():
+    """Returns f(name) mapping 'andi' / 'Andi ' / 'ANDI' to the first-seen
+    spelling, so one person isn't split into several balances."""
+    seen = {}
+
+    def canon(name: str) -> str:
+        name = name.strip()
+        return seen.setdefault(name.lower(), name)
+    return canon
+
+
+def _split_names(text: str, canon) -> list:
+    """Comma-separated names -> de-duplicated, canonicalised list (order kept)."""
+    return list(dict.fromkeys(canon(n) for n in text.split(",") if n.strip()))
+
+
 def current_month_sheet_name() -> str:
     return now_wib().strftime("%b %Y")
 
@@ -33,6 +58,8 @@ def current_month_sheet_name() -> str:
 def sanitize_sheet_name(name: str) -> str:
     bad = set('[]*/\\?:')
     cleaned = "".join(c for c in name if c not in bad).strip()
+    if cleaned.lower().startswith(STATE_PREFIX.lower()):
+        cleaned = "My " + cleaned  # reserved for the bot's internal state tabs
     return cleaned[:90] or "Untitled"
 
 
@@ -51,7 +78,8 @@ def get_or_create_worksheet(name: str):
 
 
 def list_sheet_titles():
-    return [ws.title for ws in _spreadsheet().worksheets()]
+    # Hide the bot's internal state tabs, or /switch could point expense logging at them.
+    return [ws.title for ws in _spreadsheet().worksheets() if not ws.title.startswith(STATE_PREFIX)]
 
 
 def append_expense(sheet_name, place, item, price, paid_by, shared_by, amount_per_person, picture="-", status="⏳ Unpaid", category="", date_str=None):
@@ -61,7 +89,7 @@ def append_expense(sheet_name, place, item, price, paid_by, shared_by, amount_pe
         [ts, place, item, format_price(price), paid_by, shared_by,
          format_price(amount_per_person) if amount_per_person is not None else "-",
          picture, status, "", category],
-        value_input_option="USER_ENTERED",
+        value_input_option="RAW",  # keep dates/prices as the exact text written; blocks formula injection
     )
     return ws
 
@@ -82,8 +110,50 @@ def get_recent(sheet_name, n=10):
 
 
 def delete_row(sheet_name, row_num: int):
+    if row_num < 2:
+        raise ValueError("Refusing to delete the header row.")
     ws = get_or_create_worksheet(sheet_name)
     ws.delete_rows(row_num)
+
+
+def _trim(row):
+    row = [str(c).strip() for c in row]
+    while row and not row[-1]:
+        row.pop()
+    return row
+
+
+def rows_equal(a, b) -> bool:
+    """Compare two row snapshots, ignoring trailing empty cells / whitespace."""
+    return _trim(a) == _trim(b)
+
+
+def get_row(sheet_name, row_num: int) -> list:
+    ws = get_or_create_worksheet(sheet_name)
+    return ws.row_values(row_num)
+
+
+def row_matches(sheet_name, row_num: int, snapshot) -> bool:
+    """True if the sheet's current row still equals what the user was shown.
+    Row numbers shift after deletes/sorts, so cached numbers must be verified
+    before a destructive or mutating action."""
+    return rows_equal(get_row(sheet_name, row_num), snapshot)
+
+
+def recalc_per_person(sheet_name, row_num: int):
+    """Recompute Amount/Person = Price / number of sharers (after a price or
+    shared-by edit), so settlements don't use a stale per-person figure."""
+    row = get_row(sheet_name, row_num)
+    row += [""] * (7 - len(row))
+    try:
+        price = parse_price(row[3])
+    except ValueError:
+        return
+    sharers = list(dict.fromkeys(n.strip() for n in row[5].split(",") if n.strip()))
+    if not sharers:
+        return
+    ws = get_or_create_worksheet(sheet_name)
+    _set_cell(ws, row_num, 7, format_price(price / len(sharers)))
 
 
 STATUS_COL  = 9   # 1-indexed — "Status"
@@ -95,7 +165,7 @@ def toggle_paid_status(sheet_name: str, row_num: int) -> str:
     ws = get_or_create_worksheet(sheet_name)
     current = ws.cell(row_num, STATUS_COL).value or ""
     new_status = "✅ Paid" if current != "✅ Paid" else "⏳ Unpaid"
-    ws.update_cell(row_num, STATUS_COL, new_status)
+    _set_cell(ws, row_num, STATUS_COL, new_status)
     return new_status
 
 
@@ -114,7 +184,7 @@ def get_settled_by(sheet_name: str, row_num: int) -> list:
 
 def set_settled_by(sheet_name: str, row_num: int, names: list):
     ws = get_or_create_worksheet(sheet_name)
-    ws.update_cell(row_num, SETTLED_COL, ", ".join(names))
+    _set_cell(ws, row_num, SETTLED_COL, ", ".join(names))
 
 
 # Column numbers for editable fields (1-indexed)
@@ -136,7 +206,7 @@ def update_expense_field(sheet_name: str, row_num: int, field: str, value: str):
     if col is None:
         raise ValueError(f"Unknown field: {field}")
     ws = get_or_create_worksheet(sheet_name)
-    ws.update_cell(row_num, col, value)
+    _set_cell(ws, row_num, col, value)
 
 
 def sort_by_date(sheet_name: str) -> int:
@@ -179,7 +249,7 @@ def sort_by_date(sheet_name: str) -> int:
     last_col = chr(ord("A") + width - 1)
     end_row  = 1 + len(data_rows)
     original_last_row = len(all_vals)  # includes header, 1-indexed
-    ws.update(f"A2:{last_col}{end_row}", data_rows, value_input_option="USER_ENTERED")
+    ws.update(range_name=f"A2:{last_col}{end_row}", values=data_rows)
 
     # If any fully-blank rows got filtered out above, the sorted block is now
     # shorter than the sheet's original data range — clear what's left beyond
@@ -213,6 +283,7 @@ def get_settlement_summary(sheet_name: str, start_date_str=None, end_date_str=No
         end_date = datetime.strptime(end_date_str, "%d-%m-%Y").date()
 
     balances = {}
+    canon = _name_canon()
     for row in data:
         if len(row) < 7:
             continue
@@ -232,14 +303,16 @@ def get_settlement_summary(sheet_name: str, start_date_str=None, end_date_str=No
                 continue
         try:
             price = parse_price(row[3])
-            payer = row[4].strip()
+            payer = canon(row[4])
             shared_by_str = row[5].strip()
             amt_str = row[6].strip()
             settled_str = row[9].strip() if len(row) > 9 else ""
             if not payer or not shared_by_str:
                 continue
-            sharers = [s.strip() for s in shared_by_str.split(",") if s.strip()]
-            settled_names = set(s.strip() for s in settled_str.split(",") if s.strip())
+            sharers = _split_names(shared_by_str, canon)
+            if not sharers:
+                continue
+            settled_names = set(_split_names(settled_str, canon))
             outstanding = [s for s in sharers if s not in settled_names]
             if not outstanding:
                 continue
@@ -260,7 +333,7 @@ def get_settlement_summary(sheet_name: str, start_date_str=None, end_date_str=No
     i = j = 0
     while i < len(debtors) and j < len(creditors):
         amt = min(debtors[i][1], creditors[j][1])
-        transactions.append(f"💸 *{debtors[i][0]}* pays *{creditors[j][0]}*: {format_price(amt)}")
+        transactions.append(f"💸 *{md_escape(debtors[i][0])}* pays *{md_escape(creditors[j][0])}*: {format_price(amt)}")
         debtors[i][1]   -= amt
         creditors[j][1] -= amt
         if debtors[i][1]   < 10.0: i += 1
@@ -280,6 +353,7 @@ def get_raw_summary(sheet_name: str, start_date_str=None, end_date_str=None):
         end_date = datetime.strptime(end_date_str, "%d-%m-%Y").date()
 
     direct_debts = {}
+    canon = _name_canon()
     for row in data:
         if len(row) < 7:
             continue
@@ -296,26 +370,26 @@ def get_raw_summary(sheet_name: str, start_date_str=None, end_date_str=None):
             except Exception:
                 continue
         try:
-            payer = row[4].strip()
+            payer = canon(row[4])
             shared_by_str = row[5].strip()
             amt_str = row[6].strip()
             settled_str = row[9].strip() if len(row) > 9 else ""
             if not payer or not shared_by_str or amt_str == "-":
                 continue
             amt_per_person = parse_price(amt_str)
-            sharers = [s.strip() for s in shared_by_str.split(",") if s.strip()]
-            settled_names = set(s.strip() for s in settled_str.split(",") if s.strip())
+            sharers = _split_names(shared_by_str, canon)
+            settled_names = set(_split_names(settled_str, canon))
             for person in sharers:
                 if person in settled_names:
                     continue
-                if person.lower() != payer.lower():
+                if person != payer:
                     k = (person, payer)
                     direct_debts[k] = direct_debts.get(k, 0.0) + amt_per_person
         except ValueError:
             continue
 
     return [
-        f"💸 *{d}* pays *{c}*: {format_price(a)}"
+        f"💸 *{md_escape(d)}* pays *{md_escape(c)}*: {format_price(a)}"
         for (d, c), a in direct_debts.items() if a > 10.0
     ]
 
@@ -335,6 +409,7 @@ def get_person_totals(sheet_name: str, start_date_str=None, end_date_str=None):
         end_date = datetime.strptime(end_date_str, "%d-%m-%Y").date()
 
     totals = {}
+    canon = _name_canon()
     for row in data:
         if len(row) < 7 or not any(row):
             continue
@@ -354,7 +429,7 @@ def get_person_totals(sheet_name: str, start_date_str=None, end_date_str=None):
             if not shared_by_str or amt_str == "-":
                 continue
             amt_per_person = parse_price(amt_str)
-            for person in [s.strip() for s in shared_by_str.split(",") if s.strip()]:
+            for person in _split_names(shared_by_str, canon):
                 totals[person] = totals.get(person, 0.0) + amt_per_person
         except ValueError:
             continue
@@ -376,6 +451,7 @@ def get_category_overview(sheet_name: str, start_date_str=None, end_date_str=Non
         end_date = datetime.strptime(end_date_str, "%d-%m-%Y").date()
 
     cats = {}
+    canon = _name_canon()  # "food & drink" and "Food & Drink" are the same category
     for row in data:
         if len(row) < 4 or not any(row):
             continue
@@ -390,7 +466,7 @@ def get_category_overview(sheet_name: str, start_date_str=None, end_date_str=Non
                 continue
         try:
             price    = parse_price(row[3])
-            category = row[10].strip() if len(row) > 10 and row[10].strip() else "Uncategorized"
+            category = canon(row[10]) if len(row) > 10 and row[10].strip() else "Uncategorized"
             if category not in cats:
                 cats[category] = {"total": 0.0, "count": 0}
             cats[category]["total"] += price
@@ -424,6 +500,7 @@ def get_recap(sheet_name: str) -> dict:
     biggest = None  # (price, place, item)
     cat_totals = {}
     person_totals = {}
+    canon = _name_canon()
 
     for row in data:
         if len(row) < 4 or not any(row):
@@ -440,7 +517,7 @@ def get_recap(sheet_name: str) -> dict:
         if biggest is None or price > biggest[0]:
             biggest = (price, place, item)
 
-        category = row[10].strip() if len(row) > 10 and row[10].strip() else "Uncategorized"
+        category = canon(row[10]) if len(row) > 10 and row[10].strip() else "Uncategorized"
         cat_totals[category] = cat_totals.get(category, 0.0) + price
 
         shared_by_str = row[5].strip() if len(row) > 5 else ""
@@ -448,7 +525,7 @@ def get_recap(sheet_name: str) -> dict:
         if shared_by_str and amt_str and amt_str != "-":
             try:
                 amt_per_person = parse_price(amt_str)
-                for person in [s.strip() for s in shared_by_str.split(",") if s.strip()]:
+                for person in _split_names(shared_by_str, canon):
                     person_totals[person] = person_totals.get(person, 0.0) + amt_per_person
             except ValueError:
                 pass
